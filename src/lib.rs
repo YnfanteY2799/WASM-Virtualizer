@@ -259,7 +259,7 @@ impl Chunk {
 pub struct VirtualList {
     total_items: usize,
     estimated_size: f32,
-    orientation: Orientation,
+    orientation: Orientation, // Set at construction; used by caller to interpret positions/sizes
     chunks: HashMap<usize, Chunk>,
     chunk_size: usize,
     cumulative_sizes: HashMap<usize, f64>,
@@ -392,10 +392,12 @@ impl VirtualList {
         let chunk_idx = index / self.chunk_size;
         let item_idx = index % self.chunk_size;
         let chunk = self.get_or_create_chunk(chunk_idx).map_err(convert_error)?;
-        let diff = chunk
-            .update_size(item_idx, new_size)
-            .map_err(convert_error)?;
+        let diff = chunk.update_size(item_idx, new_size).map_err(convert_error)?;
         self.total_size += diff;
+        let num_chunks = (self.total_items + self.chunk_size - 1) / self.chunk_size;
+        if num_chunks > 0 {
+            self.update_cumulative_sizes(num_chunks - 1).map_err(convert_error)?;
+        }
         Ok(())
     }
 
@@ -504,22 +506,21 @@ impl VirtualList {
         for (index, size) in self.pending_updates.drain(..) {
             let chunk_idx = index / self.chunk_size;
             let item_idx = index % self.chunk_size;
-            chunk_updates
-                .entry(chunk_idx)
-                .or_default()
-                .push((item_idx, size));
+            chunk_updates.entry(chunk_idx).or_default().push((item_idx, size));
         }
 
         let mut total_diff = 0.0;
         for (chunk_idx, updates) in chunk_updates {
             let chunk = self.get_or_create_chunk(chunk_idx).map_err(convert_error)?;
             for (item_idx, new_size) in updates {
-                total_diff += chunk
-                    .update_size(item_idx, new_size)
-                    .map_err(convert_error)?;
+                total_diff += chunk.update_size(item_idx, new_size).map_err(convert_error)?;
             }
         }
         self.total_size += total_diff;
+        let num_chunks = (self.total_items + self.chunk_size - 1) / self.chunk_size;
+        if num_chunks > 0 {
+            self.update_cumulative_sizes(num_chunks - 1).map_err(convert_error)?;
+        }
         Ok(())
     }
 }
