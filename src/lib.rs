@@ -105,39 +105,28 @@ impl VisibleRange {
 }
 
 /// Enum representing different cache eviction policies.
-///
-/// This allows you to choose how the VirtualList removes chunks from its cache when it reaches
-/// the maximum capacity (`max_cached_chunks`). Each policy suits different access patterns.
 #[wasm_bindgen]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CacheEvictionPolicy {
     /// Least Recently Used (LRU): Evicts the least recently accessed chunks.
-    /// Best for scenarios where recently accessed items are likely to be accessed again soon.
     LRU,
     /// Least Frequently Used (LFU): Evicts the least frequently accessed chunks.
-    /// Ideal when some items are accessed much more often than others, regardless of recency.
     LFU,
-    /// Custom: Placeholder for user-defined eviction strategies.
-    /// Currently unimplemented; intended for future extension where you can provide your own logic.
-    Custom,
 }
 
 /// Configuration for the VirtualList, controlling buffering, caching, and eviction behavior.
-///
-/// Use this to tune the VirtualList for your specific use case, including how it manages its cache.
 #[wasm_bindgen]
 #[derive(Clone, Debug)]
 pub struct VirtualListConfig {
-    buffer_size: usize, // Number of extra chunks to load before/after the visible area
-    overscan_items: usize, // Extra items to render beyond the viewport for smoother scrolling
-    update_batch_size: usize, // Number of size updates to batch before processing
+    buffer_size: usize,    // Number of extra chunks to load before/after visible area
+    overscan_items: usize, // Extra items to render beyond viewport
+    update_batch_size: usize, // Number of updates to batch before processing
     max_cached_chunks: usize, // Maximum number of chunks to keep in memory
-    cache_eviction_policy: CacheEvictionPolicy, // Policy for evicting chunks from the cache
+    cache_eviction_policy: CacheEvictionPolicy, // Policy for evicting chunks
 }
 
 #[wasm_bindgen]
 impl VirtualListConfig {
-    /// Creates a new configuration with sensible defaults.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self {
@@ -149,7 +138,7 @@ impl VirtualListConfig {
         }
     }
 
-    // Getters and setters with basic validation
+    // Getters and setters with validation
     #[wasm_bindgen(getter)]
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
@@ -192,16 +181,16 @@ impl VirtualListConfig {
     }
 }
 
-/// Represents a single chunk of items in the virtual list, storing sizes and positions.
+/// Represents a single chunk of items in the virtual list.
 #[derive(Clone, Debug)]
 struct Chunk {
     sizes: Vec<f32>,       // Size of each item in the chunk
     prefix_sums: Vec<f32>, // Cumulative size up to each item
-    total_size: f64,       // Total size of the chunk (high precision)
+    total_size: f64,       // Total size of the chunk
 }
 
 impl Chunk {
-    /// Creates a new chunk with the given number of items and estimated size.
+    /// Creates a new chunk with a given number of items and estimated size per item.
     fn new(chunk_size: usize, estimated_size: f32) -> Chunk {
         let estimated_size = estimated_size.max(0.0);
         let sizes = vec![estimated_size; chunk_size];
@@ -221,12 +210,12 @@ impl Chunk {
         }
     }
 
-    /// Returns the number of items in the chunk.
-    fn len(&self) -> usize {
+    #[warn(dead_code)]
+    fn _len(&self) -> usize {
         self.sizes.len()
     }
 
-    /// Updates the size of an item and adjusts total_size and prefix_sums.
+    /// Updates the size of an item in the chunk and adjusts total size and prefix sums.
     fn update_size(&mut self, index: usize, new_size: f32) -> Result<f64, VirtualListError> {
         if index >= self.sizes.len() {
             return Err(VirtualListError::IndexOutOfBounds);
@@ -244,7 +233,6 @@ impl Chunk {
         Ok(diff)
     }
 
-    /// Gets the size of an item at the given index.
     fn get_size(&self, index: usize) -> Result<f32, VirtualListError> {
         self.sizes
             .get(index)
@@ -252,15 +240,15 @@ impl Chunk {
             .ok_or(VirtualListError::IndexOutOfBounds)
     }
 
-    /// Gets the position of an item within the chunk.
-    fn get_position(&self, index: usize) -> Result<f32, VirtualListError> {
+    #[warn(dead_code)]
+    fn _get_position(&self, index: usize) -> Result<f32, VirtualListError> {
         self.prefix_sums
             .get(index)
             .copied()
             .ok_or(VirtualListError::IndexOutOfBounds)
     }
 
-    /// Finds the item at a given position within the chunk.
+    /// Finds the item at a given position within the chunk using binary search.
     fn find_item_at_position(&self, position: f32) -> Result<(usize, f32), VirtualListError> {
         if position < 0.0 || position as f64 > self.total_size {
             return Err(VirtualListError::InvalidSize);
@@ -277,17 +265,14 @@ impl Chunk {
     }
 }
 
-/// Manages cache eviction logic based on the selected policy.
-///
-/// This internal struct tracks chunk access and decides which chunk to evict when the cache is full.
+/// Manages cache eviction based on the selected policy.
 struct CacheEvictionManager {
     policy: CacheEvictionPolicy,
-    lru_order: VecDeque<usize>,       // Tracks order of access for LRU
-    frequency: HashMap<usize, usize>, // Tracks access frequency for LFU
+    lru_order: VecDeque<usize>,       // For LRU
+    frequency: HashMap<usize, usize>, // For LFU
 }
 
 impl CacheEvictionManager {
-    /// Creates a new eviction manager with the specified policy.
     fn new(policy: CacheEvictionPolicy) -> Self {
         Self {
             policy,
@@ -296,7 +281,7 @@ impl CacheEvictionManager {
         }
     }
 
-    /// Records access to a chunk, updating tracking data based on the policy.
+    /// Updates the access tracking when a chunk is accessed.
     fn access(&mut self, chunk_idx: usize) {
         match self.policy {
             CacheEvictionPolicy::LRU => {
@@ -308,89 +293,40 @@ impl CacheEvictionManager {
             CacheEvictionPolicy::LFU => {
                 *self.frequency.entry(chunk_idx).or_insert(0) += 1;
             }
-            CacheEvictionPolicy::Custom => {
-                // Placeholder for custom logic; no-op for now
-            }
         }
     }
 
-    /// Evicts a chunk based on the policy, returning its index if successful.
+    /// Evicts a chunk based on the policy and returns its index.
     fn evict(&mut self) -> Option<usize> {
         match self.policy {
             CacheEvictionPolicy::LRU => self.lru_order.pop_front(),
-            CacheEvictionPolicy::LFU => {
-                if let Some((&chunk_idx, _)) = self.frequency.iter().min_by_key(|&(_, &freq)| freq)
-                {
-                    self.frequency.remove(&chunk_idx);
-                    Some(chunk_idx)
-                } else {
-                    None
-                }
-            }
-            CacheEvictionPolicy::Custom => {
-                // Placeholder; users would define this in a future implementation
-                None
-            }
+            CacheEvictionPolicy::LFU => self
+                .frequency
+                .iter()
+                .min_by_key(|&(_, &freq)| freq)
+                .map(|(&chunk_idx, _)| chunk_idx),
         }
     }
 }
 
 /// A virtual list implementation for efficiently rendering large lists in a web environment.
-///
-/// This struct divides a large list into chunks, caching them to minimize memory usage while
-/// supporting fast scrolling and updates. It’s designed for WebAssembly and integrates with
-/// JavaScript via `wasm-bindgen`.
-///
-/// ### Key Features
-/// - **Chunking**: Splits the list into manageable chunks for efficient memory use.
-/// - **Dynamic Sizing**: Supports updating item sizes and recalculating positions.
-/// - **Batched Updates**: Queues size updates for processing in batches to optimize performance.
-/// - **Configurable Caching**: Allows tuning of cache size and eviction policies.
-///
-/// ### Caching and Eviction Policies
-/// The `VirtualList` caches chunks to avoid recreating them unnecessarily. When the cache reaches
-/// its limit (`max_cached_chunks`), it evicts chunks based on the selected policy:
-///
-/// - **LRU (Least Recently Used)**: Evicts the least recently accessed chunks.
-///   - **Use Case**: Best when recent access predicts future access (e.g., sequential scrolling).
-///   - **Example**: A long article where users scroll through content linearly.
-///
-/// - **LFU (Least Frequently Used)**: Evicts the least frequently accessed chunks.
-///   - **Use Case**: Ideal when some items are accessed more often than others (e.g., a dashboard with "hot" sections).
-///   - **Example**: A list of products where a few popular items are viewed repeatedly.
-///
-/// - **Custom**: Placeholder for user-defined eviction strategies.
-///   - **Use Case**: For specialized needs not covered by LRU or LFU (future extension).
-///   - **Example**: A policy based on item priority or external metadata.
-///
-/// To choose a policy, set `cache_eviction_policy` in `VirtualListConfig`. For example:
-/// ```javascript
-/// const config = new VirtualListConfig();
-/// config.set_cache_eviction_policy(CacheEvictionPolicy.LFU); // Use LFU
-/// const list = new VirtualList(totalItems, chunkSize, estimatedSize, Orientation.Vertical, config);
-/// ```
-///
-/// ### Performance Tips
-/// - Set `max_cached_chunks` based on available memory and chunk size.
-/// - Use `buffer_size` and `overscan_items` to balance preloading and rendering overhead.
-/// - Choose the eviction policy that matches your application’s access patterns for optimal cache hits.
 #[wasm_bindgen]
 pub struct VirtualList {
     total_items: usize,                           // Total number of items in the list
-    estimated_size: f32, // Estimated size of each item (used for uninitialized items)
-    orientation: Orientation, // Scroll direction
-    chunks: HashMap<usize, Chunk>, // Cached chunks, indexed by chunk number
-    chunk_size: usize,   // Number of items per chunk
+    estimated_size: f32,      // Estimated size of each item if not explicitly set
+    orientation: Orientation, // Scroll direction (vertical or horizontal)
+    chunks: HashMap<usize, Chunk>, // Chunks of items, loaded on demand
+    chunk_size: usize,        // Number of items per chunk
     cumulative_sizes: HashMap<usize, f64>, // Cumulative size up to each chunk
-    total_size: f64,     // Total size of all items (high precision)
+    total_size: f64,          // Total size of the list
     config: VirtualListConfig, // Configuration settings
-    pending_updates: Vec<(usize, f32)>, // Queued size updates (index, new_size)
+    pending_updates: Vec<(usize, f32)>, // Queued size updates
     cache_eviction_manager: CacheEvictionManager, // Manages cache eviction
 }
 
 #[wasm_bindgen]
 impl VirtualList {
-    /// Creates a new VirtualList with default configuration (LRU caching).
+    /// Creates a new VirtualList with default configuration.
     #[wasm_bindgen(constructor)]
     pub fn new(
         total_items: usize,
@@ -407,7 +343,7 @@ impl VirtualList {
         )
     }
 
-    /// Creates a new VirtualList with custom configuration, including eviction policy.
+    /// Creates a new VirtualList with custom configuration.
     pub fn new_with_config(
         total_items: usize,
         chunk_size: usize,
@@ -441,7 +377,7 @@ impl VirtualList {
         }
     }
 
-    /// Gets or creates a chunk for the given index, managing cache limits with the eviction policy.
+    /// Retrieves or creates a chunk at the given index.
     fn get_or_create_chunk(&mut self, chunk_idx: usize) -> Result<&mut Chunk, VirtualListError> {
         let num_chunks = (self.total_items + self.chunk_size - 1) / self.chunk_size;
         if chunk_idx >= num_chunks {
@@ -469,10 +405,7 @@ impl VirtualList {
         } else {
             self.cache_eviction_manager.access(chunk_idx);
         }
-        Ok(self
-            .chunks
-            .get_mut(&chunk_idx)
-            .expect("Chunk should exist after insertion"))
+        Ok(self.chunks.get_mut(&chunk_idx).expect("Chunk should exist"))
     }
 
     /// Updates cumulative sizes starting from a given chunk index.
@@ -504,7 +437,7 @@ impl VirtualList {
         Ok(())
     }
 
-    /// Returns the total size of the list (sum of all item sizes).
+    /// Returns the total size of the list.
     #[wasm_bindgen]
     pub fn get_total_size(&self) -> f64 {
         self.total_size
@@ -531,7 +464,7 @@ impl VirtualList {
         }
     }
 
-    /// Updates the size of an item and adjusts total size and cumulative sizes.
+    /// Updates the size of an item at the specified index.
     #[wasm_bindgen]
     pub fn update_item_size(&mut self, index: usize, new_size: f32) -> Result<(), JsValue> {
         if index >= self.total_items {
@@ -549,7 +482,7 @@ impl VirtualList {
         Ok(())
     }
 
-    /// Computes the range of visible items based on scroll position and viewport size.
+    /// Returns the range of visible items based on scroll position and viewport size.
     #[wasm_bindgen]
     pub fn get_visible_range(
         &mut self,
@@ -582,14 +515,14 @@ impl VirtualList {
         })
     }
 
-    /// Finds the chunk containing a given position.
+    /// Finds the chunk containing the given position using binary search.
     fn find_chunk_at_position(&self, position: f32) -> Result<(usize, f64), VirtualListError> {
-        let num_chunks = (self.total_items + self.chunk_size - 1) / self.chunk_size;
-        if num_chunks == 0 {
-            return Ok((0, 0.0));
+        if self.total_items == 0 {
+            return Err(VirtualListError::EmptyList);
         }
+        let num_chunks = (self.total_items + self.chunk_size - 1) / self.chunk_size;
+        let position = position.max(0.0) as f64;
 
-        let position = position as f64;
         let mut low = 0;
         let mut high = num_chunks;
         let mut last_cumulative = 0.0;
@@ -597,12 +530,13 @@ impl VirtualList {
         while low < high {
             let mid = low + (high - low) / 2;
             let cumulative = self.cumulative_sizes.get(&mid).copied().unwrap_or_else(|| {
-                let items = if mid == num_chunks - 1 && self.total_items % self.chunk_size != 0 {
+                let _items = if mid == num_chunks - 1 && self.total_items % self.chunk_size != 0 {
                     self.total_items % self.chunk_size
                 } else {
                     self.chunk_size
                 };
-                mid as f64 * self.chunk_size as f64 * self.estimated_size as f64
+                (mid as f64 * self.chunk_size as f64 * self.estimated_size as f64)
+                    .min(self.total_size)
             });
 
             if cumulative <= position {
@@ -624,7 +558,9 @@ impl VirtualList {
             return Ok((0, 0.0));
         }
         let position = position.max(0.0).min(self.total_size as f32);
-        let (chunk_idx, position_in_chunk) = self.find_chunk_at_position(position)?;
+        let (chunk_idx, position_in_chunk) = self
+            .find_chunk_at_position(position)
+            .map_err(convert_error)?;
         let chunk = self.get_or_create_chunk(chunk_idx).map_err(convert_error)?;
         let (item_idx, offset) = chunk.find_item_at_position(position_in_chunk as f32)?;
         let global_idx = chunk_idx * self.chunk_size + item_idx;
@@ -647,7 +583,7 @@ impl VirtualList {
         Ok(())
     }
 
-    /// Processes all queued updates efficiently.
+    /// Processes all queued size updates in a batch.
     #[wasm_bindgen]
     pub fn process_pending_updates(&mut self) -> Result<(), JsValue> {
         if self.pending_updates.is_empty() {
