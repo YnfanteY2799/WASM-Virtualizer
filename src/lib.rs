@@ -1,23 +1,8 @@
 use wasm_bindgen::prelude::*;
 use serde::Serialize;
-use std::cmp;
-use std::collections::{HashMap, VecDeque, HashSet, BinaryHeap};
-use std::cmp::Reverse;
-use rayon::prelude::*;
+use js_sys::Array;
 
-// Internal error type
-#[derive(Debug)]
-enum InternalError {
-    IndexOutOfBounds { index: usize, max: usize },
-    InvalidSize { value: f64 },
-    InvalidViewport { size: f64 },
-    InvalidConfiguration { param: &'static str },
-    EmptyList,
-    PrecisionLimitExceeded,
-    InvalidOperation { message: String },
-}
-
-// JS error struct
+// JS error struct for error reporting
 #[derive(Serialize)]
 struct JsError {
     kind: String,
@@ -33,53 +18,17 @@ impl JsError {
     }
 }
 
-// Convert InternalError to JsValue
-fn convert_internal_error(error: InternalError) -> JsValue {
-    match error {
-        InternalError::IndexOutOfBounds { index, max } => convert_error(
-            "IndexOutOfBounds",
-            &format!("Index {} exceeds maximum {}", index, max),
-        ),
-        InternalError::InvalidSize { value } => convert_error(
-            "InvalidSize",
-            &format!("Invalid size: {}", value),
-        ),
-        InternalError::InvalidViewport { size } => convert_error(
-            "InvalidViewport",
-            &format!("Invalid viewport size: {}", size),
-        ),
-        InternalError::InvalidConfiguration { param } => convert_error(
-            "InvalidConfiguration",
-            &format!("Invalid configuration parameter: {}", param),
-        ),
-        InternalError::EmptyList => convert_error("EmptyList", "List is empty"),
-        InternalError::PrecisionLimitExceeded => convert_error(
-            "PrecisionLimitExceeded",
-            "Position exceeds safe precision limit",
-        ),
-        InternalError::InvalidOperation { message } => convert_error("InvalidOperation", &message),
-    }
-}
-
-// Generic error conversion
+// Convert error to JsValue for JavaScript interop
 fn convert_error(kind: &str, message: &str) -> JsValue {
     serde_wasm_bindgen::to_value(&JsError::new(kind, message)).unwrap()
 }
 
-// Orientation enum
+// Orientation enum for list direction
 #[wasm_bindgen]
 #[derive(Clone, Copy)]
 pub enum Orientation {
     Vertical,
     Horizontal,
-}
-
-// Cache eviction policy enum
-#[wasm_bindgen]
-#[derive(Clone, Copy)]
-pub enum CacheEvictionPolicy {
-    LRU,
-    LFU,
 }
 
 // Configuration struct
@@ -88,10 +37,8 @@ pub enum CacheEvictionPolicy {
 pub struct VirtualListConfig {
     buffer_size: usize,
     overscan_items: usize,
+    #[allow(dead_code)]
     update_batch_size: usize,
-    max_cached_chunks: usize,
-    cache_eviction_policy: CacheEvictionPolicy,
-    max_memory_bytes: Option<usize>,
 }
 
 #[wasm_bindgen]
@@ -102,9 +49,6 @@ impl VirtualListConfig {
             buffer_size: 5,
             overscan_items: 3,
             update_batch_size: 10,
-            max_cached_chunks: 100,
-            cache_eviction_policy: CacheEvictionPolicy::LRU,
-            max_memory_bytes: None,
         }
     }
 
@@ -112,14 +56,14 @@ impl VirtualListConfig {
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
     }
+
     #[wasm_bindgen(setter)]
     pub fn set_buffer_size(&mut self, size: usize) {
         self.buffer_size = size.max(1);
     }
-    // Add other getters/setters as needed
 }
 
-// Visible range struct
+// Visible range struct for rendering
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct VisibleRange {
@@ -135,152 +79,66 @@ impl VisibleRange {
     pub fn start(&self) -> usize {
         self.start
     }
+
     #[wasm_bindgen(getter)]
     pub fn end(&self) -> usize {
         self.end
     }
+
     #[wasm_bindgen(getter)]
     pub fn start_offset(&self) -> f64 {
         self.start_offset
     }
+
     #[wasm_bindgen(getter)]
     pub fn end_offset(&self) -> f64 {
         self.end_offset
     }
 }
 
-// Chunk struct
-#[derive(Debug)]
+// Chunk struct to manage item sizes
+#[derive(Clone)]
 struct Chunk {
     sizes: Vec<f64>,
-    prefix_sums: Vec<f64>,
     total_size: f64,
 }
 
 impl Chunk {
-    fn new(chunk_size: usize, estimated_size: f64) -> Result<Self, InternalError> {
+    fn new(chunk_size: usize, estimated_size: f64) -> Result<Self, String> {
         if estimated_size.is_nan() || estimated_size < 0.0 {
-            return Err(InternalError::InvalidSize { value: estimated_size });
+            return Err(format!("Invalid size: {}", estimated_size));
         }
         let sizes = vec![estimated_size; chunk_size];
-        let mut prefix_sums = Vec::with_capacity(chunk_size + 1);
-        prefix_sums.push(0.0);
-        let mut total_size = 0.0;
-        for &size in &sizes {
-            total_size += size;
-            prefix_sums.push(total_size);
-        }
-        Ok(Chunk {
-            sizes,
-            prefix_sums,
-            total_size,
-        })
+        let total_size = estimated_size * chunk_size as f64;
+        Ok(Chunk { sizes, total_size })
     }
 
-    fn update_size(&mut self, index: usize, new_size: f64) -> Result<f64, InternalError> {
+    fn update_size(&mut self, index: usize, new_size: f64) -> Result<f64, String> {
         if index >= self.sizes.len() {
-            return Err(InternalError::IndexOutOfBounds {
-                index,
-                max: self.sizes.len() - 1,
-            });
+            return Err(format!("Index {} out of bounds", index));
         }
         if new_size.is_nan() || new_size < 0.0 {
-            return Err(InternalError::InvalidSize { value: new_size });
+            return Err(format!("Invalid size: {}", new_size));
         }
         let old_size = self.sizes[index];
-        let diff = new_size - old_size;
         self.sizes[index] = new_size;
+        let diff = new_size - old_size;
         self.total_size += diff;
-        for i in index + 1..self.prefix_sums.len() {
-            self.prefix_sums[i] += diff;
-        }
         Ok(diff)
     }
 
-    fn get_size(&self, index: usize) -> Result<f64, InternalError> {
-        self.sizes
-            .get(index)
-            .copied()
-            .ok_or(InternalError::IndexOutOfBounds {
-                index,
-                max: self.sizes.len() - 1,
-            })
-    }
-
-    fn find_item_at_position(&self, position: f64) -> Result<(usize, f64), InternalError> {
+    fn find_item_at_position(&self, position: f64) -> Result<(usize, f64), String> {
         if position.is_nan() || position < 0.0 || position > self.total_size {
-            return Err(InternalError::InvalidSize { value: position });
+            return Err(format!("Invalid position: {}", position));
         }
-        let index = self
-            .prefix_sums
-            .binary_search_by(|&sum| {
-                sum.partial_cmp(&position).unwrap_or(std::cmp::Ordering::Greater)
-            })
-            .unwrap_or_else(|e| e - 1);
-        let offset = position - self.prefix_sums[index];
-        Ok((index, offset))
-    }
-
-    fn memory_usage(&self) -> usize {
-        (self.sizes.capacity() * 8) + (self.prefix_sums.capacity() * 8)
-    }
-}
-
-// Cache eviction manager with min-heap for LFU
-struct CacheEvictionManager {
-    policy: CacheEvictionPolicy,
-    lru_order: VecDeque<usize>,
-    lru_set: HashSet<usize>,
-    frequency: HashMap<usize, usize>,
-    min_heap: BinaryHeap<Reverse<(usize, usize)>>, // (frequency, chunk_idx)
-}
-
-impl CacheEvictionManager {
-    fn new(policy: CacheEvictionPolicy) -> Self {
-        Self {
-            policy,
-            lru_order: VecDeque::new(),
-            lru_set: HashSet::new(),
-            frequency: HashMap::new(),
-            min_heap: BinaryHeap::new(),
+        let mut cumulative = 0.0;
+        for (i, &size) in self.sizes.iter().enumerate() {
+            if cumulative + size > position {
+                return Ok((i, position - cumulative));
+            }
+            cumulative += size;
         }
-    }
-
-    fn access(&mut self, chunk_idx: usize) {
-        match self.policy {
-            CacheEvictionPolicy::LRU => {
-                if self.lru_set.contains(&chunk_idx) {
-                    self.lru_order.retain(|&x| x != chunk_idx);
-                }
-                self.lru_order.push_back(chunk_idx);
-                self.lru_set.insert(chunk_idx);
-            }
-            CacheEvictionPolicy::LFU => {
-                let freq = self.frequency.entry(chunk_idx).or_insert(0);
-                *freq += 1;
-                self.min_heap.push(Reverse((*freq, chunk_idx)));
-            }
-        }
-    }
-
-    fn evict(&mut self) -> Option<usize> {
-        match self.policy {
-            CacheEvictionPolicy::LRU => {
-                self.lru_order.pop_front().map(|idx| {
-                    self.lru_set.remove(&idx);
-                    idx
-                })
-            }
-            CacheEvictionPolicy::LFU => {
-                while let Some(Reverse((freq, idx))) = self.min_heap.pop() {
-                    if self.frequency.get(&idx) == Some(&freq) {
-                        self.frequency.remove(&idx);
-                        return Some(idx);
-                    }
-                }
-                None
-            }
-        }
+        Ok((self.sizes.len() - 1, position - cumulative))
     }
 }
 
@@ -289,21 +147,18 @@ impl CacheEvictionManager {
 pub struct VirtualList {
     total_items: usize,
     estimated_size: f64,
+    #[allow(dead_code)]
     orientation: Orientation,
     chunks: Vec<Option<Chunk>>,
     chunk_size: usize,
-    cumulative_sizes: Vec<f64>,
     total_size: f64,
     config: VirtualListConfig,
-    pending_updates: Vec<(usize, f64)>,
-    cache_eviction_manager: CacheEvictionManager,
-    current_memory_usage: usize,
 }
 
 #[wasm_bindgen]
 impl VirtualList {
     #[wasm_bindgen(constructor)]
-    pub fn new_with_config(
+    pub fn new(
         total_items: usize,
         chunk_size: usize,
         estimated_size: f64,
@@ -311,42 +166,31 @@ impl VirtualList {
         config: VirtualListConfig,
     ) -> Result<VirtualList, JsValue> {
         if chunk_size == 0 {
-            return Err(convert_error("InvalidConfiguration", "chunk_size must be positive"));
-        }
-        if config.buffer_size == 0 {
-            return Err(convert_error("InvalidConfiguration", "buffer_size must be positive"));
+            return Err(convert_error("InvalidConfig", "chunk_size must be positive"));
         }
         if estimated_size.is_nan() || estimated_size < 0.0 {
             return Err(convert_error(
                 "InvalidSize",
-                &format!("Estimated size must be non-negative, got {}", estimated_size),
+                &format!("Invalid estimated size: {}", estimated_size),
             ));
         }
 
         let num_chunks = (total_items + chunk_size - 1) / chunk_size;
-        let mut list = VirtualList {
+        let total_size = estimated_size * total_items as f64;
+        Ok(VirtualList {
             total_items,
             estimated_size,
             orientation,
             chunks: vec![None; num_chunks],
             chunk_size,
-            cumulative_sizes: vec![0.0; num_chunks],
-            total_size: estimated_size * total_items as f64,
+            total_size,
             config,
-            pending_updates: Vec::with_capacity(config.update_batch_size),
-            cache_eviction_manager: CacheEvictionManager::new(config.cache_eviction_policy),
-            current_memory_usage: 0,
-        };
-        list.update_cumulative_sizes_from(0).map_err(convert_internal_error)?;
-        Ok(list)
+        })
     }
 
-    fn get_or_create_chunk(&mut self, chunk_idx: usize) -> Result<&mut Chunk, InternalError> {
+    fn get_or_create_chunk(&mut self, chunk_idx: usize) -> Result<&mut Chunk, String> {
         if chunk_idx >= self.chunks.len() {
-            return Err(InternalError::IndexOutOfBounds {
-                index: chunk_idx,
-                max: self.chunks.len() - 1,
-            });
+            return Err(format!("Chunk index {} out of bounds", chunk_idx));
         }
         if self.chunks[chunk_idx].is_none() {
             let items_in_chunk = if chunk_idx == self.chunks.len() - 1
@@ -356,41 +200,9 @@ impl VirtualList {
             } else {
                 self.chunk_size
             };
-            let chunk = Chunk::new(items_in_chunk, self.estimated_size)?;
-            self.current_memory_usage += chunk.memory_usage();
-            self.chunks[chunk_idx] = Some(chunk);
-            self.cache_eviction_manager.access(chunk_idx);
-            self.enforce_memory_limit()?;
-        } else {
-            self.cache_eviction_manager.access(chunk_idx);
+            self.chunks[chunk_idx] = Some(Chunk::new(items_in_chunk, self.estimated_size)?);
         }
         Ok(self.chunks[chunk_idx].as_mut().expect("Chunk exists"))
-    }
-
-    fn enforce_memory_limit(&mut self) -> Result<(), InternalError> {
-        if let Some(max_bytes) = self.config.max_memory_bytes {
-            while self.current_memory_usage > max_bytes
-                && self.chunks.iter().filter(|c| c.is_some()).count() > 0
-            {
-                if let Some(old_idx) = self.cache_eviction_manager.evict() {
-                    if let Some(chunk) = self.chunks[old_idx].take() {
-                        self.current_memory_usage -= chunk.memory_usage();
-                    }
-                } else {
-                    break;
-                }
-            }
-        } else {
-            while self.chunks.iter().filter(|c| c.is_some()).count() > self.config.max_cached_chunks
-            {
-                if let Some(old_idx) = self.cache_eviction_manager.evict() {
-                    if let Some(chunk) = self.chunks[old_idx].take() {
-                        self.current_memory_usage -= chunk.memory_usage();
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     #[wasm_bindgen]
@@ -398,44 +210,17 @@ impl VirtualList {
         if index >= self.total_items {
             return Err(convert_error(
                 "IndexOutOfBounds",
-                &format!("Index {} exceeds maximum {}", index, self.total_items - 1),
+                &format!("Index {} exceeds total items", index),
             ));
         }
         let chunk_idx = index / self.chunk_size;
         let item_idx = index % self.chunk_size;
-        let chunk = self.get_or_create_chunk(chunk_idx).map_err(convert_internal_error)?;
-        let diff = chunk.update_size(item_idx, new_size).map_err(convert_internal_error)?;
-        self.total_size += diff;
-        self.update_cumulative_sizes_from(chunk_idx).map_err(convert_internal_error)?;
-        Ok(())
-    }
-
-    fn update_cumulative_sizes_from(&mut self, from_chunk: usize) -> Result<(), InternalError> {
-        let num_chunks = self.chunks.len();
-        if from_chunk >= num_chunks {
-            return Err(InternalError::IndexOutOfBounds {
-                index: from_chunk,
-                max: num_chunks - 1,
-            });
-        }
-        let mut cumulative = if from_chunk == 0 {
-            0.0
-        } else {
-            self.cumulative_sizes[from_chunk - 1]
-        };
-        for i in from_chunk..num_chunks {
-            cumulative += if let Some(chunk) = &self.chunks[i] {
-                chunk.total_size
-            } else {
-                let items = if i == num_chunks - 1 && self.total_items % self.chunk_size != 0 {
-                    self.total_items % self.chunk_size
-                } else {
-                    self.chunk_size
-                };
-                self.estimated_size * items as f64
-            };
-            self.cumulative_sizes[i] = cumulative;
-        }
+        let chunk = self
+            .get_or_create_chunk(chunk_idx)
+            .map_err(|e| convert_error("ChunkError", &e))?;
+        chunk
+            .update_size(item_idx, new_size)
+            .map_err(|e| convert_error("UpdateError", &e))?;
         Ok(())
     }
 
@@ -446,24 +231,23 @@ impl VirtualList {
         viewport_size: f64,
     ) -> Result<VisibleRange, JsValue> {
         if viewport_size <= 0.0 {
-            return Err(convert_error(
-                "InvalidViewport",
-                &format!("Viewport size must be positive, got {}", viewport_size),
-            ));
+            return Err(convert_error("InvalidViewport", "Viewport size must be positive"));
         }
         if self.total_items == 0 {
             return Err(convert_error("EmptyList", "List is empty"));
         }
         let scroll_position = scroll_position.max(0.0).min(self.total_size);
         let end_position = (scroll_position + viewport_size).min(self.total_size);
-        let (start_idx, start_offset) =
-            self.find_item_at_position(scroll_position).map_err(convert_internal_error)?;
-        let (end_idx, end_offset) =
-            self.find_item_at_position(end_position).map_err(convert_internal_error)?;
+        let (start_idx, start_offset) = self
+            .find_item_at_position(scroll_position)
+            .map_err(|e| convert_error("PositionError", &e))?;
+        let (end_idx, end_offset) = self
+            .find_item_at_position(end_position)
+            .map_err(|e| convert_error("PositionError", &e))?;
         let buffer = self.config.buffer_size;
         let overscan = self.config.overscan_items;
         let start = start_idx.saturating_sub(buffer + overscan);
-        let end = cmp::min(end_idx + buffer + overscan + 1, self.total_items);
+        let end = (end_idx + buffer + overscan + 1).min(self.total_items);
         Ok(VisibleRange {
             start,
             end,
@@ -472,82 +256,75 @@ impl VirtualList {
         })
     }
 
-    fn find_item_at_position(&mut self, position: f64) -> Result<(usize, f64), InternalError> {
-        const MAX_SAFE_POSITION: f64 = 1e15; // Threshold for precision safety
+    fn find_item_at_position(&mut self, position: f64) -> Result<(usize, f64), String> {
         if self.total_items == 0 {
             return Ok((0, 0.0));
         }
-        if position > MAX_SAFE_POSITION {
-            return Err(InternalError::PrecisionLimitExceeded);
-        }
-        let (chunk_idx, position_in_chunk) =
-            self.find_chunk_at_position(position).map_err(|e| e)?;
-        let chunk = self.get_or_create_chunk(chunk_idx)?;
+        // Cache values to avoid borrowing conflicts
+        let chunk_size = self.chunk_size;
+        let estimated_size = self.estimated_size;
+        let chunk_idx = (position / (chunk_size as f64 * estimated_size)) as usize;
+        let chunk = self.get_or_create_chunk(chunk_idx.min(self.chunks.len() - 1))?;
+        let position_in_chunk = position - (chunk_idx as f64 * chunk_size as f64 * estimated_size);
         let (item_idx, offset) = chunk.find_item_at_position(position_in_chunk)?;
-        let global_idx = chunk_idx * self.chunk_size + item_idx;
+        let global_idx = chunk_idx * chunk_size + item_idx;
         Ok((global_idx.min(self.total_items - 1), offset))
     }
 
-    fn find_chunk_at_position(&self, position: f64) -> Result<(usize, f64), InternalError> {
-        if self.total_items == 0 {
-            return Err(InternalError::EmptyList);
-        }
-        if position.is_nan() || position < 0.0 || position > self.total_size {
-            return Err(InternalError::InvalidSize { value: position });
-        }
-        let chunk_idx = self
-            .cumulative_sizes
-            .binary_search_by(|&sum| {
-                sum.partial_cmp(&position).unwrap_or(std::cmp::Ordering::Greater)
+    #[wasm_bindgen]
+    pub fn batch_update_sizes(&mut self, updates: Vec<JsValue>) -> Result<(), JsValue> {
+        // Parse the updates from JsValue into (index, size) pairs
+        let parsed_updates: Vec<Result<(usize, f64), String>> = updates
+            .into_iter()
+            .map(|js_val| {
+                let arr = js_val
+                    .dyn_into::<Array>()
+                    .map_err(|_| "Invalid update format".to_string())?;
+                if arr.length() != 2 {
+                    return Err("Each update must be an array of [index, size]".to_string());
+                }
+                let index = arr
+                    .get(0)
+                    .as_f64()
+                    .ok_or("Index must be a number".to_string())? as usize;
+                let size = arr
+                    .get(1)
+                    .as_f64()
+                    .ok_or("Size must be a number".to_string())?;
+                Ok((index, size))
             })
-            .unwrap_or_else(|e| e - 1);
-        let last_cumulative = if chunk_idx == 0 {
-            0.0
-        } else {
-            self.cumulative_sizes[chunk_idx - 1]
-        };
-        let position_in_chunk = position - last_cumulative;
-        Ok((chunk_idx, position_in_chunk))
-    }
-
-    #[wasm_bindgen]
-    pub fn clear_cache(&mut self) {
-        self.chunks.iter_mut().for_each(|chunk| *chunk = None);
-        self.current_memory_usage = 0;
-    }
-
-    #[wasm_bindgen]
-    pub fn add_items(&mut self, count: usize, size: f64) -> Result<(), JsValue> {
-        if size.is_nan() || size < 0.0 {
-            return Err(convert_error("InvalidSize", "Size must be non-negative"));
+            .collect();
+    
+        let updates: Vec<(usize, f64)> = parsed_updates
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| convert_error("InvalidUpdate", &e))?;
+    
+        // Process updates sequentially
+        let mut errors = Vec::new();
+        for &(index, new_size) in &updates {
+            if index >= self.total_items {
+                errors.push(format!("Index {} out of bounds", index));
+            } else {
+                let chunk_idx = index / self.chunk_size;
+                let item_idx = index % self.chunk_size;
+                match self.get_or_create_chunk(chunk_idx) {  // Mutable borrow is safe here
+                    Ok(chunk) => {
+                        if let Err(e) = chunk.update_size(item_idx, new_size) {
+                            errors.push(e);
+                        }
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
         }
-        self.total_items += count;
-        let num_chunks = (self.total_items + self.chunk_size - 1) / self.chunk_size;
-        self.chunks.resize_with(num_chunks, || None);
-        self.cumulative_sizes.resize(num_chunks, 0.0);
-        self.total_size += size * count as f64;
-        self.update_cumulative_sizes_from(0).map_err(convert_internal_error)?;
-        Ok(())
-    }
-
-    #[wasm_bindgen]
-    pub fn remove_items(&mut self, count: usize) -> Result<(), JsValue> {
-        if count > self.total_items {
-            return Err(convert_error("InvalidOperation", "Cannot remove more items than exist"));
+    
+        // Update total_size after all changes
+        if !errors.is_empty() {
+            return Err(convert_error("BatchUpdateError", &errors.join(", ")));
         }
-        self.total_items -= count;
-        let num_chunks = (self.total_items + self.chunk_size - 1) / self.chunk_size;
-        self.chunks.truncate(num_chunks);
-        self.cumulative_sizes.truncate(num_chunks);
-        self.total_size = self.cumulative_sizes.last().unwrap_or(&0.0).clone();
-        Ok(())
-    }
-
-    #[wasm_bindgen]
-    pub fn batch_update_sizes(&mut self, updates: Vec<(usize, f64)>) -> Result<(), JsValue> {
-        updates.par_iter().try_for_each(|&(index, new_size)| {
-            self.update_item_size(index, new_size)
-        })?;
+    
+        self.total_size = self.chunks.iter().flatten().map(|chunk| chunk.total_size).sum();
         Ok(())
     }
 }
