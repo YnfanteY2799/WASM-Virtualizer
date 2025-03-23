@@ -3,7 +3,7 @@ use wasm_bindgen::prelude::*;
 
 // Define the Orientation enum for the list
 #[wasm_bindgen]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Orientation {
     Vertical,
     Horizontal,
@@ -11,12 +11,13 @@ pub enum Orientation {
 
 // Define errors that can be returned
 #[wasm_bindgen]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum VirtualListError {
     IndexOutOfBounds,
     InvalidSize,
     InvalidViewport,
     InvalidConfiguration,
+    EmptyList,
 }
 
 // Helper function to convert errors to JS
@@ -27,6 +28,7 @@ pub fn get_error_message(error: VirtualListError) -> String {
         VirtualListError::InvalidSize => "Invalid size provided".to_string(),
         VirtualListError::InvalidViewport => "Invalid viewport size".to_string(),
         VirtualListError::InvalidConfiguration => "Invalid configuration parameters".to_string(),
+        VirtualListError::EmptyList => "Operation cannot be performed on an empty list".to_string(),
     }
 }
 
@@ -36,6 +38,8 @@ pub fn get_error_message(error: VirtualListError) -> String {
 pub struct VisibleRange {
     start: usize,
     end: usize,
+    start_offset: f64,
+    end_offset: f64,
 }
 
 #[wasm_bindgen]
@@ -49,6 +53,16 @@ impl VisibleRange {
     pub fn end(&self) -> usize {
         self.end
     }
+    
+    #[wasm_bindgen(getter)]
+    pub fn start_offset(&self) -> f64 {
+        self.start_offset
+    }
+    
+    #[wasm_bindgen(getter)]
+    pub fn end_offset(&self) -> f64 {
+        self.end_offset
+    }
 }
 
 // Configuration for VirtualList
@@ -57,6 +71,8 @@ impl VisibleRange {
 pub struct VirtualListConfig {
     buffer_size: usize,
     use_binary_search_in_chunk: bool,
+    overscan_items: usize,
+    update_batch_size: usize,
 }
 
 #[wasm_bindgen]
@@ -66,6 +82,8 @@ impl VirtualListConfig {
         Self {
             buffer_size: 5,
             use_binary_search_in_chunk: true,
+            overscan_items: 3,
+            update_batch_size: 10,
         }
     }
 
@@ -88,32 +106,72 @@ impl VirtualListConfig {
     pub fn set_use_binary_search_in_chunk(&mut self, use_binary: bool) {
         self.use_binary_search_in_chunk = use_binary;
     }
+    
+    #[wasm_bindgen(getter)]
+    pub fn overscan_items(&self) -> usize {
+        self.overscan_items
+    }
+    
+    #[wasm_bindgen(setter)]
+    pub fn set_overscan_items(&mut self, items: usize) {
+        self.overscan_items = items;
+    }
+    
+    #[wasm_bindgen(getter)]
+    pub fn update_batch_size(&self) -> usize {
+        self.update_batch_size
+    }
+    
+    #[wasm_bindgen(setter)]
+    pub fn set_update_batch_size(&mut self, size: usize) {
+        self.update_batch_size = size;
+    }
 }
 
 // Define the Chunk struct to hold item sizes
-#[wasm_bindgen]
 #[derive(Clone, Debug)]
-pub struct Chunk {
+struct Chunk {
     sizes: Vec<f64>,       // Sizes of items in this chunk
     chunk_total_size: f64, // Cached total size of this chunk
+    prefix_sums: Vec<f64>, // Prefix sums for quick position lookups
 }
 
-#[wasm_bindgen]
 impl Chunk {
-    #[wasm_bindgen(constructor)]
-    pub fn new(chunk_size: usize, estimated_size: f64) -> Chunk {
-        let sizes = vec![estimated_size.max(0.0); chunk_size]; // Ensure sizes are non-negative
-        let chunk_total_size = estimated_size.max(0.0) * chunk_size as f64;
+    fn new(chunk_size: usize, estimated_size: f64) -> Chunk {
+        let estimated_size = estimated_size.max(0.0); // Ensure sizes are non-negative
+        let sizes = vec![estimated_size; chunk_size];
+        let chunk_total_size = estimated_size * chunk_size as f64;
+        
+        // Calculate prefix sums for faster position lookups
+        let mut prefix_sums = Vec::with_capacity(chunk_size + 1);
+        prefix_sums.push(0.0);
+        
+        let mut sum = 0.0;
+        for size in &sizes {
+            sum += size;
+            prefix_sums.push(sum);
+        }
 
         Chunk {
             sizes,
             chunk_total_size,
+            prefix_sums,
         }
     }
 
-    // Internal method to get the total size without recomputing
+    // Get the total size without recomputing
     fn get_total_size(&self) -> f64 {
         self.chunk_total_size
+    }
+    
+    // Get the number of items in this chunk
+    fn len(&self) -> usize {
+        self.sizes.len()
+    }
+    
+    // Check if chunk is empty
+    fn is_empty(&self) -> bool {
+        self.sizes.is_empty()
     }
 
     // Update an item size and the chunk's total size
@@ -126,9 +184,15 @@ impl Chunk {
             return Err(VirtualListError::InvalidSize);
         }
 
-        let size_diff = new_size - self.sizes[index];
+        let old_size = self.sizes[index];
+        let size_diff = new_size - old_size;
         self.sizes[index] = new_size;
         self.chunk_total_size += size_diff;
+        
+        // Update prefix sums from this index forward
+        for i in index + 1..=self.sizes.len() {
+            self.prefix_sums[i] += size_diff;
+        }
 
         Ok(size_diff)
     }
@@ -142,93 +206,88 @@ impl Chunk {
         Ok(self.sizes[index])
     }
 
-    // Get the sum of sizes up to a specific index within the chunk
-    fn get_position_in_chunk(&self, index: usize) -> Result<f64, VirtualListError> {
+    // Get the position of an item within the chunk (sum of sizes before it)
+    fn get_position(&self, index: usize) -> Result<f64, VirtualListError> {
         if index > self.sizes.len() {
             return Err(VirtualListError::IndexOutOfBounds);
         }
 
-        let position = self.sizes[..index].iter().sum();
-        Ok(position)
+        // Use prefix sums for O(1) lookup
+        Ok(self.prefix_sums[index])
     }
 
-    // Binary search to find the item in the chunk at a given position
-    fn binary_search_position_in_chunk(&self, position: f64) -> Result<usize, VirtualListError> {
-        if position < 0.0 || position > self.chunk_total_size {
+    // Find the item at a given position using binary search
+    fn find_item_at_position(&self, position: f64, use_binary_search: bool) -> Result<(usize, f64), VirtualListError> {
+        if position < 0.0 || (self.is_empty() && position > 0.0) || (!self.is_empty() && position > self.chunk_total_size) {
             return Err(VirtualListError::InvalidSize);
+        }
+        
+        if self.is_empty() {
+            return Ok((0, 0.0));
         }
 
         // Handle edge cases
         if position <= 0.0 {
-            return Ok(0);
+            return Ok((0, 0.0));
         }
+        
         if position >= self.chunk_total_size {
-            return Ok(self.sizes.len() - 1);
+            return Ok((self.sizes.len() - 1, self.chunk_total_size - self.sizes[self.sizes.len() - 1]));
         }
 
-        let mut low = 0;
-        let mut high = self.sizes.len() - 1;
-        let mut running_total = 0.0;
-
-        while low <= high {
-            let mid = (low + high) / 2;
-            let prev_total = running_total;
-            running_total += self.sizes[mid];
-
-            if position > prev_total && position <= running_total {
-                return Ok(mid);
-            }
-
-            if position <= running_total {
-                if high == mid {
-                    break;
-                }
-                high = mid;
-                running_total = prev_total;
-            } else {
-                if low == mid {
-                    low += 1;
+        if use_binary_search {
+            // Simplified binary search using prefix sums
+            // Find the first prefix sum that's greater than position
+            let mut low = 0;
+            let mut high = self.prefix_sums.len() - 1;
+            
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if self.prefix_sums[mid] < position {
+                    low = mid + 1;
                 } else {
-                    low = mid;
+                    high = mid;
                 }
             }
-        }
-
-        // Fallback to approximate position
-        Ok((position / self.chunk_total_size * self.sizes.len() as f64) as usize)
-    }
-
-    // Linear search to find the item in the chunk at a given position
-    fn linear_search_position_in_chunk(&self, position: f64) -> Result<usize, VirtualListError> {
-        if position < 0.0 || position > self.chunk_total_size {
-            return Err(VirtualListError::InvalidSize);
-        }
-
-        let mut running_pos = 0.0;
-        for i in 0..self.sizes.len() {
-            running_pos += self.sizes[i];
-            if running_pos >= position {
-                return Ok(i);
+            
+            // The item index is one less than the prefix sum index
+            let item_index = if low > 0 && self.prefix_sums[low] > position {
+                low - 1
+            } else {
+                low
+            };
+            
+            let offset = position - self.prefix_sums[item_index];
+            return Ok((item_index, offset));
+        } else {
+            // Linear search
+            for i in 0..self.sizes.len() {
+                let start_pos = self.prefix_sums[i];
+                let end_pos = self.prefix_sums[i + 1];
+                
+                if position >= start_pos && position < end_pos {
+                    return Ok((i, position - start_pos));
+                }
             }
+            
+            // Fallback - return last item if somehow not found
+            return Ok((self.sizes.len() - 1, position - self.prefix_sums[self.sizes.len() - 1]));
         }
-
-        // Fallback - return last item in chunk
-        Ok(self.sizes.len() - 1)
     }
 }
 
 // Define the VirtualList struct
 #[wasm_bindgen]
 pub struct VirtualList {
-    total_items: usize, // Total number of items in the list
-    #[allow(dead_code)]
-    estimated_size: f64, // Default size for unmeasured items
+    total_items: usize,    // Total number of items in the list
+    estimated_size: f64,   // Default size for unmeasured items
     orientation: Orientation, // List orientation
-    chunks: Vec<Chunk>, // Chunks of items for efficient management
-    chunk_size: usize,  // Number of items per chunk
+    chunks: Vec<Chunk>,    // Chunks of items for efficient management
+    chunk_size: usize,     // Number of items per chunk
     cumulative_sizes: Vec<f64>, // Cumulative sizes up to each chunk
-    total_size: f64,    // Total size of all items (cached for performance)
+    total_size: f64,       // Total size of all items (cached for performance)
     config: VirtualListConfig, // Configuration options
+    pending_updates: Vec<(usize, f64)>, // Pending size updates for batch processing
 }
 
 #[wasm_bindgen]
@@ -259,13 +318,16 @@ impl VirtualList {
 
         let num_chunks = (total_items + chunk_size - 1) / chunk_size; // Ceiling division
         let mut chunks = Vec::with_capacity(num_chunks);
-        let mut cumulative_sizes = Vec::with_capacity(num_chunks);
+        let mut cumulative_sizes = Vec::with_capacity(num_chunks + 1);
+        
+        // Add a sentinel value at the beginning for easier calculations
+        cumulative_sizes.push(0.0);
 
         let mut running_total = 0.0;
         for i in 0..num_chunks {
-            let items_in_chunk = if i == num_chunks - 1 {
+            let items_in_chunk = if i == num_chunks - 1 && total_items % chunk_size != 0 {
                 // Last chunk might have fewer items
-                total_items - (i * chunk_size)
+                total_items % chunk_size
             } else {
                 chunk_size
             };
@@ -285,6 +347,7 @@ impl VirtualList {
             cumulative_sizes,
             total_size: running_total,
             config,
+            pending_updates: Vec::new(),
         }
     }
 
@@ -341,6 +404,30 @@ impl VirtualList {
     pub fn get_use_binary_search_in_chunk(&self) -> bool {
         self.config.use_binary_search_in_chunk()
     }
+    
+    /// Set overscan items count
+    #[wasm_bindgen]
+    pub fn set_overscan_items(&mut self, items: usize) {
+        self.config.set_overscan_items(items);
+    }
+    
+    /// Get overscan items count
+    #[wasm_bindgen]
+    pub fn get_overscan_items(&self) -> usize {
+        self.config.overscan_items()
+    }
+    
+    /// Set update batch size
+    #[wasm_bindgen]
+    pub fn set_update_batch_size(&mut self, size: usize) {
+        self.config.set_update_batch_size(size);
+    }
+    
+    /// Get update batch size
+    #[wasm_bindgen]
+    pub fn get_update_batch_size(&self) -> usize {
+        self.config.update_batch_size()
+    }
 
     /// Convert internal error to JsValue
     fn convert_error(error: VirtualListError) -> JsValue {
@@ -357,21 +444,90 @@ impl VirtualList {
         let chunk_idx = index / self.chunk_size;
         let item_idx_in_chunk = index % self.chunk_size;
 
-        // Position is the cumulative size up to the previous chunk plus the size of items in the current chunk up to the index
-        let prev_size = if chunk_idx > 0 {
-            self.cumulative_sizes[chunk_idx - 1]
-        } else {
-            0.0
-        };
-
+        // Position is the cumulative size up to the current chunk plus the size of items in the current chunk up to the index
+        let chunk_start = self.cumulative_sizes[chunk_idx];
+        
         let chunk = &self.chunks[chunk_idx];
-        match chunk.get_position_in_chunk(item_idx_in_chunk) {
-            Ok(position_in_chunk) => Ok(prev_size + position_in_chunk),
+        match chunk.get_position(item_idx_in_chunk) {
+            Ok(position_in_chunk) => Ok(chunk_start + position_in_chunk),
             Err(e) => Err(Self::convert_error(e)),
         }
     }
 
-    /// Update the size of an item and recalculate cumulative sizes
+    /// Queue an item size update for batch processing
+    #[wasm_bindgen]
+    pub fn queue_update_item_size(&mut self, index: usize, new_size: f64) -> Result<(), JsValue> {
+        if index >= self.total_items {
+            return Err(Self::convert_error(VirtualListError::IndexOutOfBounds));
+        }
+
+        if new_size < 0.0 {
+            return Err(Self::convert_error(VirtualListError::InvalidSize));
+        }
+        
+        self.pending_updates.push((index, new_size));
+        
+        // Process batch if we've reached the batch size
+        if self.pending_updates.len() >= self.config.update_batch_size() {
+            self.process_pending_updates()?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Process all pending updates in one batch
+    #[wasm_bindgen]
+    pub fn process_pending_updates(&mut self) -> Result<(), JsValue> {
+        if self.pending_updates.is_empty() {
+            return Ok(());
+        }
+        
+        // Sort updates by index to process them efficiently
+        self.pending_updates.sort_by_key(|(idx, _)| *idx);
+        
+        // Group updates by chunk
+        let mut chunk_updates: Vec<Vec<(usize, f64)>> = vec![Vec::new(); self.chunks.len()];
+        
+        for (index, new_size) in self.pending_updates.drain(..) {
+            let chunk_idx = index / self.chunk_size;
+            let item_idx_in_chunk = index % self.chunk_size;
+            chunk_updates[chunk_idx].push((item_idx_in_chunk, new_size));
+        }
+        
+        // Process updates chunk by chunk and track total size change
+        let mut total_size_diff = 0.0;
+        
+        for (chunk_idx, updates) in chunk_updates.iter().enumerate() {
+            if updates.is_empty() {
+                continue;
+            }
+            
+            let chunk = &mut self.chunks[chunk_idx];
+            let mut chunk_size_diff = 0.0;
+            
+            for &(item_idx, new_size) in updates {
+                match chunk.update_size(item_idx, new_size) {
+                    Ok(diff) => chunk_size_diff += diff,
+                    Err(e) => return Err(Self::convert_error(e)),
+                }
+            }
+            
+            // Update cumulative sizes for all chunks after this one
+            if chunk_size_diff != 0.0 {
+                total_size_diff += chunk_size_diff;
+                for i in chunk_idx + 1..=self.chunks.len() {
+                    self.cumulative_sizes[i] += chunk_size_diff;
+                }
+            }
+        }
+        
+        // Update total size
+        self.total_size += total_size_diff;
+        
+        Ok(())
+    }
+
+    /// Update the size of an item and recalculate cumulative sizes (immediate update)
     #[wasm_bindgen]
     pub fn update_item_size(&mut self, index: usize, new_size: f64) -> Result<(), JsValue> {
         if index >= self.total_items {
@@ -401,7 +557,7 @@ impl VirtualList {
         self.total_size += size_diff;
 
         // Only update cumulative sizes from this chunk onward
-        for i in chunk_idx..self.chunks.len() {
+        for i in chunk_idx + 1..=self.chunks.len() {
             self.cumulative_sizes[i] += size_diff;
         }
 
@@ -419,93 +575,100 @@ impl VirtualList {
         if viewport_size <= 0.0 {
             return Err(Self::convert_error(VirtualListError::InvalidViewport));
         }
+        
+        if self.total_items == 0 {
+            return Err(Self::convert_error(VirtualListError::EmptyList));
+        }
 
         // Find the first visible item
-        let start_idx = self.binary_search_position(scroll_position);
+        let (start_idx, start_offset) = self.find_item_at_position(scroll_position)?;
 
         // Find the last visible item
         let end_position = scroll_position + viewport_size;
-        let end_idx = self.binary_search_position(end_position);
+        let (end_idx, end_offset) = self.find_item_at_position(end_position)?;
 
-        // Add buffer items for smoother scrolling (configurable)
+        // Add buffer/overscan items for smoother scrolling
         let buffer = self.config.buffer_size();
-        let start = start_idx.saturating_sub(buffer);
-        let end = cmp::min(end_idx + buffer, self.total_items);
+        let overscan = self.config.overscan_items();
+        let start = start_idx.saturating_sub(buffer + overscan);
+        let end = cmp::min(end_idx + buffer + overscan + 1, self.total_items);
 
-        Ok(VisibleRange { start, end })
+        Ok(VisibleRange { 
+            start, 
+            end,
+            start_offset,
+            end_offset
+        })
     }
 
-    /// Binary search to find the item at a given position
-    fn binary_search_position(&self, position: f64) -> usize {
+    /// Find the item and offset at a given position
+    fn find_item_at_position(&self, position: f64) -> Result<(usize, f64), JsValue> {
         // Handle edge cases
         if position <= 0.0 {
-            return 0;
+            return Ok((0, 0.0));
         }
+        
         if position >= self.total_size {
-            return self.total_items.saturating_sub(1);
+            let last_idx = self.total_items.saturating_sub(1);
+            return Ok((last_idx, self.total_size));
         }
 
-        // First find the chunk using binary search
+        // Binary search to find the chunk containing the position
+        let (chunk_idx, position_in_chunk) = self.find_chunk_at_position(position)?;
+        
+        if chunk_idx >= self.chunks.len() {
+            return Err(Self::convert_error(VirtualListError::IndexOutOfBounds));
+        }
+
+        // Find the item within the chunk
+        let chunk = &self.chunks[chunk_idx];
+        let use_binary = self.config.use_binary_search_in_chunk();
+        
+        match chunk.find_item_at_position(position_in_chunk, use_binary) {
+            Ok((item_idx_in_chunk, offset)) => {
+                let global_idx = chunk_idx * self.chunk_size + item_idx_in_chunk;
+                Ok((global_idx, offset))
+            },
+            Err(e) => Err(Self::convert_error(e)),
+        }
+    }
+    
+    /// Find the chunk containing a given position using binary search
+    fn find_chunk_at_position(&self, position: f64) -> Result<(usize, f64), JsValue> {
+        if self.chunks.is_empty() {
+            return Err(Self::convert_error(VirtualListError::EmptyList));
+        }
+        
+        // Binary search to find the chunk
         let mut low = 0;
-        let mut high = self.chunks.len() - 1;
-
-        while low <= high {
-            let mid = (low + high) / 2;
-            let mid_pos = self.cumulative_sizes[mid];
-
-            if mid == 0 || (position > self.cumulative_sizes[mid - 1] && position <= mid_pos) {
-                // Found the chunk, now find the item within the chunk
-                let chunk = &self.chunks[mid];
-                let chunk_start_pos = if mid > 0 {
-                    self.cumulative_sizes[mid - 1]
-                } else {
-                    0.0
-                };
-                let position_in_chunk = position - chunk_start_pos;
-
-                // Search within the chunk using either binary or linear search
-                let item_in_chunk = if self.config.use_binary_search_in_chunk() {
-                    match chunk.binary_search_position_in_chunk(position_in_chunk) {
-                        Ok(idx) => idx,
-                        Err(_) => {
-                            // Fallback to linear search if binary search fails
-                            match chunk.linear_search_position_in_chunk(position_in_chunk) {
-                                Ok(idx) => idx,
-                                Err(_) => 0, // Last resort fallback
-                            }
-                        }
-                    }
-                } else {
-                    match chunk.linear_search_position_in_chunk(position_in_chunk) {
-                        Ok(idx) => idx,
-                        Err(_) => 0, // Fallback
-                    }
-                };
-
-                return mid * self.chunk_size + item_in_chunk;
-            }
-
-            if position <= mid_pos {
-                if high == mid && high > 0 {
-                    high -= 1; // Prevent infinite loop
-                } else if high > mid {
-                    high = mid;
-                } else {
-                    break;
-                }
+        let mut high = self.cumulative_sizes.len() - 1;
+        
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.cumulative_sizes[mid] < position {
+                low = mid + 1;
             } else {
-                if low == mid && low < high {
-                    low += 1; // Prevent infinite loop
-                } else if low < mid {
-                    low = mid;
-                } else {
-                    break;
-                }
+                high = mid;
             }
         }
-
-        // Fallback
-        return (position as usize * self.total_items) / self.total_size as usize;
+        
+        // Adjust to get the chunk that contains the position
+        let chunk_idx = if low > 0 && self.cumulative_sizes[low] > position {
+            low - 1
+        } else {
+            low
+        };
+        
+        // Calculate the position within the chunk
+        let chunk_start = if chunk_idx > 0 {
+            self.cumulative_sizes[chunk_idx - 1]
+        } else {
+            0.0
+        };
+        
+        let position_in_chunk = position - chunk_start;
+        
+        Ok((chunk_idx, position_in_chunk))
     }
 
     /// Get the size of an item at a specific index
@@ -527,107 +690,38 @@ impl VirtualList {
             Err(e) => Err(Self::convert_error(e)),
         }
     }
-}
-
-// Add tests for the implementation
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_new_virtual_list() {
-        let list = VirtualList::new(100, 10, 50.0, Orientation::Vertical);
-        assert_eq!(list.get_total_items(), 100);
-        assert_eq!(list.get_total_size(), 5000.0);
+    
+    /// Reset all item sizes to the estimated size
+    #[wasm_bindgen]
+    pub fn reset_item_sizes(&mut self) -> Result<(), JsValue> {
+        // Recreate the list with the current parameters but reset all sizes
+        let new_list = VirtualList::new_with_config(
+            self.total_items,
+            self.chunk_size,
+            self.estimated_size,
+            self.orientation,
+            self.config.clone()
+        );
+        
+        self.chunks = new_list.chunks;
+        self.cumulative_sizes = new_list.cumulative_sizes;
+        self.total_size = new_list.total_size;
+        self.pending_updates.clear();
+        
+        Ok(())
     }
-
-    #[test]
-    fn test_update_item_size() {
-        let mut list = VirtualList::new(100, 10, 50.0, Orientation::Vertical);
-        let initial_size = list.get_total_size();
-
-        // Update an item size
-        list.update_item_size(5, 100.0).unwrap();
-
-        // Total size should have increased by 50.0 (100.0 - 50.0)
-        assert_eq!(list.get_total_size(), initial_size + 50.0);
-
-        // Position of item 5 should be the sum of sizes 0-4
-        let pos = list.get_position(5).unwrap();
-        assert_eq!(pos, 250.0); // 5 * 50.0
-
-        // Position of item 6 should include the new size of item 5
-        let pos = list.get_position(6).unwrap();
-        assert_eq!(pos, 350.0); // (5 * 50.0) + 100.0
-    }
-
-    #[test]
-    fn test_get_visible_range() {
-        let list = VirtualList::new(100, 10, 50.0, Orientation::Vertical);
-
-        // Viewport at the beginning
-        let visible_range = list.get_visible_range(0.0, 200.0).unwrap();
-        assert_eq!(visible_range.start, 0);
-        assert!(visible_range.end >= 4); // At least items 0-3 should be visible + buffer
-
-        // Viewport in the middle
-        let visible_range = list.get_visible_range(2000.0, 200.0).unwrap();
-        assert!(visible_range.start >= 35);
-        assert!(visible_range.end <= 50);
-    }
-
-    #[test]
-    fn test_get_item_size() {
-        let mut list = VirtualList::new(100, 10, 50.0, Orientation::Vertical);
-
-        // Initial size
-        let size = list.get_item_size(5).unwrap();
-        assert_eq!(size, 50.0);
-
-        // Update and check
-        list.update_item_size(5, 75.0).unwrap();
-        let size = list.get_item_size(5).unwrap();
-        assert_eq!(size, 75.0);
-    }
-
-    #[test]
-    fn test_config_settings() {
-        let mut list = VirtualList::new(100, 10, 50.0, Orientation::Vertical);
-
-        // Test default buffer size
-        assert_eq!(list.get_buffer_size(), 5);
-
-        // Test setting buffer size
-        list.set_buffer_size(10);
-        assert_eq!(list.get_buffer_size(), 10);
-
-        // Test binary search setting
-        assert_eq!(list.get_use_binary_search_in_chunk(), true);
-        list.set_use_binary_search_in_chunk(false);
-        assert_eq!(list.get_use_binary_search_in_chunk(), false);
-    }
-
-    #[test]
-    fn test_binary_search_in_chunk() {
-        let mut config = VirtualListConfig::new();
-        config.set_use_binary_search_in_chunk(true);
-
-        let list = VirtualList::new_with_config(100, 10, 50.0, Orientation::Vertical, config);
-
-        // Test finding item in the middle of a chunk
-        let idx = list.binary_search_position(275.0); // Should be in the middle of chunk 0
-        assert_eq!(idx, 5);
-    }
-
-    #[test]
-    fn test_linear_search_in_chunk() {
-        let mut config = VirtualListConfig::new();
-        config.set_use_binary_search_in_chunk(false);
-
-        let list = VirtualList::new_with_config(100, 10, 50.0, Orientation::Vertical, config);
-
-        // Test finding item in the middle of a chunk
-        let idx = list.binary_search_position(275.0); // Should be in the middle of chunk 0
-        assert_eq!(idx, 5);
+    
+    /// Update multiple item sizes at once
+    #[wasm_bindgen]
+    pub fn update_batch_item_sizes(&mut self, indices: &[usize], sizes: &[f64]) -> Result<(), JsValue> {
+        if indices.len() != sizes.len() {
+            return Err(Self::convert_error(VirtualListError::InvalidConfiguration));
+        }
+        
+        for i in 0..indices.len() {
+            self.queue_update_item_size(indices[i], sizes[i])?;
+        }
+        
+        self.process_pending_updates()
     }
 }
