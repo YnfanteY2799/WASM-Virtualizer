@@ -4,7 +4,6 @@ use serde::Serialize;
 use std::cmp;
 use std::collections::HashMap;
 
-// JS error struct for error reporting
 #[derive(Serialize)]
 struct JsError {
     kind: String,
@@ -20,12 +19,10 @@ impl JsError {
     }
 }
 
-// Convert error to JsValue for JavaScript interop
 fn convert_error(kind: &str, message: &str) -> JsValue {
     serde_wasm_bindgen::to_value(&JsError::new(kind, message)).unwrap()
 }
 
-// Orientation enum for list direction
 #[wasm_bindgen]
 #[derive(Clone, Copy)]
 pub enum Orientation {
@@ -33,13 +30,11 @@ pub enum Orientation {
     Horizontal,
 }
 
-// Configuration struct
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct VirtualListConfig {
     buffer_size: usize,
     overscan_items: usize,
-    #[allow(dead_code)]
     update_batch_size: usize,
 }
 
@@ -65,7 +60,6 @@ impl VirtualListConfig {
     }
 }
 
-// Visible range struct for rendering
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct VisibleRange {
@@ -98,7 +92,6 @@ impl VisibleRange {
     }
 }
 
-// Chunk struct to manage item sizes with prefix sums
 #[derive(Clone)]
 struct Chunk {
     sizes: Vec<f64>,
@@ -119,11 +112,10 @@ impl Chunk {
             cumulative += size;
             prefix_sums.push(cumulative);
         }
-        let total_size = cumulative;
         Ok(Chunk {
             sizes,
             prefix_sums,
-            total_size,
+            total_size: cumulative,
         })
     }
 
@@ -159,12 +151,10 @@ impl Chunk {
     }
 }
 
-// Main VirtualList struct with cumulative sizes
 #[wasm_bindgen]
 pub struct VirtualList {
     total_items: usize,
     estimated_size: f64,
-    #[allow(dead_code)]
     orientation: Orientation,
     chunks: Vec<Option<Chunk>>,
     chunk_size: usize,
@@ -175,6 +165,14 @@ pub struct VirtualList {
 
 #[wasm_bindgen]
 impl VirtualList {
+    /// Creates a new VirtualList instance.
+    /// 
+    /// # Arguments
+    /// * `total_items` - Total number of items in the list.
+    /// * `chunk_size` - Number of items per chunk.
+    /// * `estimated_size` - Initial estimated size per item (must be >= 0).
+    /// * `orientation` - Vertical or Horizontal (logic applies to both).
+    /// * `config` - Configuration for buffering and overscan.
     #[wasm_bindgen(constructor)]
     pub fn new(
         total_items: usize,
@@ -235,6 +233,7 @@ impl VirtualList {
         Ok(self.chunks[chunk_idx].as_mut().expect("Chunk exists"))
     }
 
+    /// Updates the size of an item at the given index.
     #[wasm_bindgen]
     pub fn update_item_size(&mut self, index: usize, new_size: f64) -> Result<(), JsValue> {
         if index >= self.total_items {
@@ -263,6 +262,12 @@ impl VirtualList {
         Ok(())
     }
 
+    /// Gets the range of visible items based on scroll position and viewport size.
+    /// Includes partially visible items and applies buffer and overscan.
+    /// 
+    /// # Notes
+    /// - Call this with updated `viewport_size` on browser resize.
+    /// - Floating-point precision may introduce minor errors in very large lists.
     #[wasm_bindgen]
     pub fn get_visible_range(
         &mut self,
@@ -277,16 +282,37 @@ impl VirtualList {
         }
         let scroll_position = scroll_position.max(0.0).min(self.total_size);
         let end_position = (scroll_position + viewport_size).min(self.total_size);
-        let (start_idx, start_offset) = self
+
+        let (mut start, start_offset) = self
             .find_item_at_position(scroll_position)
             .map_err(|e| convert_error("PositionError", &e))?;
-        let (end_idx, end_offset) = self
+        let (mut end, end_offset) = self
             .find_item_at_position(end_position)
             .map_err(|e| convert_error("PositionError", &e))?;
+
+        // Adjust for partially visible items
+        while start > 0 {
+            let prev_start = self.get_item_start(start - 1)?;
+            let prev_size = self.get_item_size(start - 1)?;
+            if prev_start + prev_size <= scroll_position {
+                break;
+            }
+            start -= 1;
+        }
+        while end < self.total_items {
+            let next_start = self.get_item_start(end)?;
+            if next_start >= scroll_position + viewport_size {
+                break;
+            }
+            end += 1;
+        }
+
+        // Apply buffer and overscan
         let buffer = self.config.buffer_size;
         let overscan = self.config.overscan_items;
-        let start = start_idx.saturating_sub(buffer + overscan);
-        let end = (end_idx + buffer + overscan + 1).min(self.total_items);
+        let start = start.saturating_sub(buffer + overscan);
+        let end = (end + buffer + overscan).min(self.total_items);
+
         Ok(VisibleRange {
             start,
             end,
@@ -317,6 +343,7 @@ impl VirtualList {
         Ok((global_idx.min(self.total_items - 1), offset))
     }
 
+    /// Updates multiple item sizes in a batch for efficiency.
     #[wasm_bindgen]
     pub fn batch_update_sizes(&mut self, updates: Vec<JsValue>) -> Result<(), JsValue> {
         let parsed_updates: Vec<Result<(usize, f64), String>> = updates
@@ -345,7 +372,6 @@ impl VirtualList {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| convert_error("InvalidUpdate", &e))?;
 
-        // Group updates by chunk index
         let mut chunk_updates: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
         for (index, new_size) in updates {
             if index >= self.total_items {
@@ -362,7 +388,6 @@ impl VirtualList {
                 .push((item_idx, new_size));
         }
 
-        // Apply updates and calculate net difference per chunk
         let mut chunk_diffs: HashMap<usize, f64> = HashMap::new();
         for (chunk_idx, updates) in chunk_updates {
             let chunk = self
@@ -378,7 +403,6 @@ impl VirtualList {
             chunk_diffs.insert(chunk_idx, total_diff);
         }
 
-        // Update cumulative sizes in a single pass
         let min_chunk_idx = chunk_diffs.keys().min().cloned().unwrap_or(0);
         let mut cumulative_diff = 0.0;
         for i in min_chunk_idx..self.chunks.len() {
@@ -390,7 +414,126 @@ impl VirtualList {
             }
         }
         self.total_size += cumulative_diff;
-
         Ok(())
+    }
+
+    /// Sets a new total number of items, adjusting chunks and sizes.
+    #[wasm_bindgen]
+    pub fn set_total_items(&mut self, new_total: usize) -> Result<(), JsValue> {
+        if new_total == self.total_items {
+            return Ok(());
+        }
+        let new_num_chunks = if new_total == 0 {
+            0
+        } else {
+            (new_total + self.chunk_size - 1) / self.chunk_size
+        };
+        let old_num_chunks = self.chunks.len();
+
+        if new_num_chunks > old_num_chunks {
+            self.chunks.resize_with(new_num_chunks, || None);
+            let mut last_cumulative = if old_num_chunks > 0 {
+                self.cumulative_sizes[old_num_chunks - 1]
+            } else {
+                0.0
+            };
+            for i in old_num_chunks..new_num_chunks {
+                let items_in_chunk = if i == new_num_chunks - 1 && new_total % self.chunk_size != 0
+                {
+                    new_total % self.chunk_size
+                } else {
+                    self.chunk_size
+                };
+                let chunk_total = items_in_chunk as f64 * self.estimated_size;
+                last_cumulative += chunk_total;
+                self.cumulative_sizes.push(last_cumulative);
+            }
+        } else if new_num_chunks < old_num_chunks {
+            self.chunks.truncate(new_num_chunks);
+            self.cumulative_sizes.truncate(new_num_chunks);
+            if new_num_chunks > 0 {
+                let last_chunk_idx = new_num_chunks - 1;
+                let items_in_last_chunk = if new_total % self.chunk_size == 0 {
+                    self.chunk_size
+                } else {
+                    new_total % self.chunk_size
+                };
+                let last_chunk_total = if let Some(chunk) = &self.chunks[last_chunk_idx] {
+                    chunk.sizes[..items_in_last_chunk].iter().sum::<f64>()
+                } else {
+                    items_in_last_chunk as f64 * self.estimated_size
+                };
+                if last_chunk_idx == 0 {
+                    self.cumulative_sizes[0] = last_chunk_total;
+                } else {
+                    self.cumulative_sizes[last_chunk_idx] =
+                        self.cumulative_sizes[last_chunk_idx - 1] + last_chunk_total;
+                }
+                self.total_size = self.cumulative_sizes[last_chunk_idx];
+            } else {
+                self.total_size = 0.0;
+            }
+        } else if new_total % self.chunk_size != 0 {
+            let last_chunk_idx = new_num_chunks - 1;
+            let items_in_last_chunk = new_total % self.chunk_size;
+            let last_chunk_total = if let Some(chunk) = &self.chunks[last_chunk_idx] {
+                chunk.sizes[..items_in_last_chunk].iter().sum::<f64>()
+            } else {
+                items_in_last_chunk as f64 * self.estimated_size
+            };
+            if last_chunk_idx == 0 {
+                self.cumulative_sizes[0] = last_chunk_total;
+            } else {
+                self.cumulative_sizes[last_chunk_idx] =
+                    self.cumulative_sizes[last_chunk_idx - 1] + last_chunk_total;
+            }
+            self.total_size = self.cumulative_sizes[last_chunk_idx];
+        }
+        self.total_items = new_total;
+        Ok(())
+    }
+
+    /// Unloads a chunk to free memory.
+    #[wasm_bindgen]
+    pub fn unload_chunk(&mut self, chunk_idx: usize) -> Result<(), JsValue> {
+        if chunk_idx >= self.chunks.len() {
+            return Err(convert_error(
+                "InvalidChunkIndex",
+                &format!("Chunk index {} out of bounds", chunk_idx),
+            ));
+        }
+        self.chunks[chunk_idx] = None;
+        Ok(())
+    }
+
+    fn get_item_size(&self, index: usize) -> Result<f64, String> {
+        if index >= self.total_items {
+            return Err(format!("Index {} out of bounds", index));
+        }
+        let chunk_idx = index / self.chunk_size;
+        let item_idx = index % self.chunk_size;
+        Ok(if let Some(chunk) = &self.chunks[chunk_idx] {
+            chunk.sizes[item_idx]
+        } else {
+            self.estimated_size
+        })
+    }
+
+    fn get_item_start(&self, index: usize) -> Result<f64, String> {
+        if index >= self.total_items {
+            return Err(format!("Index {} out of bounds", index));
+        }
+        let chunk_idx = index / self.chunk_size;
+        let item_idx = index % self.chunk_size;
+        let chunk_start = if chunk_idx > 0 {
+            self.cumulative_sizes[chunk_idx - 1]
+        } else {
+            0.0
+        };
+        Ok(if let Some(chunk) = &self.chunks[chunk_idx] {
+            chunk_start + chunk.prefix_sums[item_idx]
+        } else {
+            chunk_start + item_idx as f64 * self.estimated_size
+        })
     }
 }
