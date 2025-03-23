@@ -16,6 +16,7 @@ pub enum VirtualListError {
     IndexOutOfBounds,
     InvalidSize,
     InvalidViewport,
+    InvalidConfiguration,
 }
 
 // Helper function to convert errors to JS
@@ -25,6 +26,7 @@ pub fn get_error_message(error: VirtualListError) -> String {
         VirtualListError::IndexOutOfBounds => "Index out of bounds".to_string(),
         VirtualListError::InvalidSize => "Invalid size provided".to_string(),
         VirtualListError::InvalidViewport => "Invalid viewport size".to_string(),
+        VirtualListError::InvalidConfiguration => "Invalid configuration parameters".to_string(),
     }
 }
 
@@ -46,6 +48,45 @@ impl VisibleRange {
     #[wasm_bindgen(getter)]
     pub fn end(&self) -> usize {
         self.end
+    }
+}
+
+// Configuration for VirtualList
+#[wasm_bindgen]
+#[derive(Clone, Debug)]
+pub struct VirtualListConfig {
+    buffer_size: usize,
+    use_binary_search_in_chunk: bool,
+}
+
+#[wasm_bindgen]
+impl VirtualListConfig {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            buffer_size: 5,
+            use_binary_search_in_chunk: true,
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn buffer_size(&self) -> usize {
+        self.buffer_size
+    }
+
+    #[wasm_bindgen(setter)]
+    pub fn set_buffer_size(&mut self, size: usize) {
+        self.buffer_size = size;
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn use_binary_search_in_chunk(&self) -> bool {
+        self.use_binary_search_in_chunk
+    }
+
+    #[wasm_bindgen(setter)]
+    pub fn set_use_binary_search_in_chunk(&mut self, use_binary: bool) {
+        self.use_binary_search_in_chunk = use_binary;
     }
 }
 
@@ -92,6 +133,15 @@ impl Chunk {
         Ok(size_diff)
     }
 
+    // Get the size of an item at a specific index within the chunk
+    fn get_size(&self, index: usize) -> Result<f64, VirtualListError> {
+        if index >= self.sizes.len() {
+            return Err(VirtualListError::IndexOutOfBounds);
+        }
+
+        Ok(self.sizes[index])
+    }
+
     // Get the sum of sizes up to a specific index within the chunk
     fn get_position_in_chunk(&self, index: usize) -> Result<f64, VirtualListError> {
         if index > self.sizes.len() {
@@ -100,6 +150,70 @@ impl Chunk {
 
         let position = self.sizes[..index].iter().sum();
         Ok(position)
+    }
+
+    // Binary search to find the item in the chunk at a given position
+    fn binary_search_position_in_chunk(&self, position: f64) -> Result<usize, VirtualListError> {
+        if position < 0.0 || position > self.chunk_total_size {
+            return Err(VirtualListError::InvalidSize);
+        }
+
+        // Handle edge cases
+        if position <= 0.0 {
+            return Ok(0);
+        }
+        if position >= self.chunk_total_size {
+            return Ok(self.sizes.len() - 1);
+        }
+
+        let mut low = 0;
+        let mut high = self.sizes.len() - 1;
+        let mut running_total = 0.0;
+
+        while low <= high {
+            let mid = (low + high) / 2;
+            let prev_total = running_total;
+            running_total += self.sizes[mid];
+
+            if position > prev_total && position <= running_total {
+                return Ok(mid);
+            }
+
+            if position <= running_total {
+                if high == mid {
+                    break;
+                }
+                high = mid;
+                running_total = prev_total;
+            } else {
+                if low == mid {
+                    low += 1;
+                } else {
+                    low = mid;
+                }
+            }
+        }
+
+        // Fallback to approximate position
+        Ok((position / self.chunk_total_size * self.sizes.len() as f64) as usize)
+    }
+
+    // Linear search to find the item in the chunk at a given position
+    fn linear_search_position_in_chunk(&self, position: f64) -> Result<usize, VirtualListError> {
+        if position < 0.0 || position > self.chunk_total_size {
+            return Err(VirtualListError::InvalidSize);
+        }
+
+        let mut running_pos = 0.0;
+        for i in 0..self.sizes.len() {
+            running_pos += self.sizes[i];
+            if running_pos >= position {
+                return Ok(i);
+            }
+        }
+
+        // Fallback - return last item in chunk
+        Ok(self.sizes.len() - 1)
     }
 }
 
@@ -114,6 +228,7 @@ pub struct VirtualList {
     chunk_size: usize,  // Number of items per chunk
     cumulative_sizes: Vec<f64>, // Cumulative sizes up to each chunk
     total_size: f64,    // Total size of all items (cached for performance)
+    config: VirtualListConfig, // Configuration options
 }
 
 #[wasm_bindgen]
@@ -125,6 +240,18 @@ impl VirtualList {
         chunk_size: usize,
         estimated_size: f64,
         orientation: Orientation,
+    ) -> VirtualList {
+        let config = VirtualListConfig::new();
+        Self::new_with_config(total_items, chunk_size, estimated_size, orientation, config)
+    }
+
+    /// Constructor with custom configuration
+    pub fn new_with_config(
+        total_items: usize,
+        chunk_size: usize,
+        estimated_size: f64,
+        orientation: Orientation,
+        config: VirtualListConfig,
     ) -> VirtualList {
         // Validate inputs
         let chunk_size = cmp::max(1, chunk_size); // Ensure chunk size is at least 1
@@ -157,6 +284,7 @@ impl VirtualList {
             chunk_size,
             cumulative_sizes,
             total_size: running_total,
+            config,
         }
     }
 
@@ -180,13 +308,50 @@ impl VirtualList {
         self.orientation = orientation;
     }
 
+    /// Get the configuration
+    pub fn get_config(&self) -> VirtualListConfig {
+        self.config.clone()
+    }
+
+    /// Set configuration
+    pub fn set_config(&mut self, config: VirtualListConfig) {
+        self.config = config;
+    }
+
+    /// Set buffer size for visible range calculations
+    #[wasm_bindgen]
+    pub fn set_buffer_size(&mut self, buffer_size: usize) {
+        self.config.set_buffer_size(buffer_size);
+    }
+
+    /// Get buffer size
+    #[wasm_bindgen]
+    pub fn get_buffer_size(&self) -> usize {
+        self.config.buffer_size()
+    }
+
+    /// Enable or disable binary search in chunks
+    #[wasm_bindgen]
+    pub fn set_use_binary_search_in_chunk(&mut self, use_binary: bool) {
+        self.config.set_use_binary_search_in_chunk(use_binary);
+    }
+
+    /// Get current binary search setting
+    #[wasm_bindgen]
+    pub fn get_use_binary_search_in_chunk(&self) -> bool {
+        self.config.use_binary_search_in_chunk()
+    }
+
+    /// Convert internal error to JsValue
+    fn convert_error(error: VirtualListError) -> JsValue {
+        JsValue::from_str(&get_error_message(error))
+    }
+
     /// Get the position of an item in the list
     #[wasm_bindgen]
     pub fn get_position(&self, index: usize) -> Result<f64, JsValue> {
         if index >= self.total_items {
-            return Err(JsValue::from_str(&get_error_message(
-                VirtualListError::IndexOutOfBounds,
-            )));
+            return Err(Self::convert_error(VirtualListError::IndexOutOfBounds));
         }
 
         let chunk_idx = index / self.chunk_size;
@@ -202,7 +367,7 @@ impl VirtualList {
         let chunk = &self.chunks[chunk_idx];
         match chunk.get_position_in_chunk(item_idx_in_chunk) {
             Ok(position_in_chunk) => Ok(prev_size + position_in_chunk),
-            Err(e) => Err(JsValue::from_str(&get_error_message(e))),
+            Err(e) => Err(Self::convert_error(e)),
         }
     }
 
@@ -210,15 +375,11 @@ impl VirtualList {
     #[wasm_bindgen]
     pub fn update_item_size(&mut self, index: usize, new_size: f64) -> Result<(), JsValue> {
         if index >= self.total_items {
-            return Err(JsValue::from_str(&get_error_message(
-                VirtualListError::IndexOutOfBounds,
-            )));
+            return Err(Self::convert_error(VirtualListError::IndexOutOfBounds));
         }
 
         if new_size < 0.0 {
-            return Err(JsValue::from_str(&get_error_message(
-                VirtualListError::InvalidSize,
-            )));
+            return Err(Self::convert_error(VirtualListError::InvalidSize));
         }
 
         let chunk_idx = index / self.chunk_size;
@@ -228,7 +389,7 @@ impl VirtualList {
         let chunk = &mut self.chunks[chunk_idx];
         let size_diff = match chunk.update_size(item_idx_in_chunk, new_size) {
             Ok(diff) => diff,
-            Err(e) => return Err(JsValue::from_str(&get_error_message(e))),
+            Err(e) => return Err(Self::convert_error(e)),
         };
 
         // If size didn't change, no need to update cumulative sizes
@@ -256,9 +417,7 @@ impl VirtualList {
         viewport_size: f64,
     ) -> Result<VisibleRange, JsValue> {
         if viewport_size <= 0.0 {
-            return Err(JsValue::from_str(&get_error_message(
-                VirtualListError::InvalidViewport,
-            )));
+            return Err(Self::convert_error(VirtualListError::InvalidViewport));
         }
 
         // Find the first visible item
@@ -268,8 +427,8 @@ impl VirtualList {
         let end_position = scroll_position + viewport_size;
         let end_idx = self.binary_search_position(end_position);
 
-        // Add buffer items for smoother scrolling (can be adjusted)
-        let buffer = 5;
+        // Add buffer items for smoother scrolling (configurable)
+        let buffer = self.config.buffer_size();
         let start = start_idx.saturating_sub(buffer);
         let end = cmp::min(end_idx + buffer, self.total_items);
 
@@ -304,17 +463,26 @@ impl VirtualList {
                 };
                 let position_in_chunk = position - chunk_start_pos;
 
-                // Linear search within the chunk (could optimize with binary search if needed)
-                let mut running_pos = 0.0;
-                for i in 0..chunk.sizes.len() {
-                    running_pos += chunk.sizes[i];
-                    if running_pos >= position_in_chunk {
-                        return mid * self.chunk_size + i;
+                // Search within the chunk using either binary or linear search
+                let item_in_chunk = if self.config.use_binary_search_in_chunk() {
+                    match chunk.binary_search_position_in_chunk(position_in_chunk) {
+                        Ok(idx) => idx,
+                        Err(_) => {
+                            // Fallback to linear search if binary search fails
+                            match chunk.linear_search_position_in_chunk(position_in_chunk) {
+                                Ok(idx) => idx,
+                                Err(_) => 0, // Last resort fallback
+                            }
+                        }
                     }
-                }
+                } else {
+                    match chunk.linear_search_position_in_chunk(position_in_chunk) {
+                        Ok(idx) => idx,
+                        Err(_) => 0, // Fallback
+                    }
+                };
 
-                // Fallback - return last item in chunk
-                return mid * self.chunk_size + chunk.sizes.len() - 1;
+                return mid * self.chunk_size + item_in_chunk;
             }
 
             if position <= mid_pos {
@@ -344,20 +512,19 @@ impl VirtualList {
     #[wasm_bindgen]
     pub fn get_item_size(&self, index: usize) -> Result<f64, JsValue> {
         if index >= self.total_items {
-            return Err(JsValue::from_str(&get_error_message(
-                VirtualListError::IndexOutOfBounds,
-            )));
+            return Err(Self::convert_error(VirtualListError::IndexOutOfBounds));
         }
 
         let chunk_idx = index / self.chunk_size;
         let item_idx_in_chunk = index % self.chunk_size;
 
-        if chunk_idx < self.chunks.len() && item_idx_in_chunk < self.chunks[chunk_idx].sizes.len() {
-            Ok(self.chunks[chunk_idx].sizes[item_idx_in_chunk])
-        } else {
-            Err(JsValue::from_str(&get_error_message(
-                VirtualListError::IndexOutOfBounds,
-            )))
+        if chunk_idx >= self.chunks.len() {
+            return Err(Self::convert_error(VirtualListError::IndexOutOfBounds));
+        }
+
+        match self.chunks[chunk_idx].get_size(item_idx_in_chunk) {
+            Ok(size) => Ok(size),
+            Err(e) => Err(Self::convert_error(e)),
         }
     }
 }
@@ -421,5 +588,46 @@ mod tests {
         list.update_item_size(5, 75.0).unwrap();
         let size = list.get_item_size(5).unwrap();
         assert_eq!(size, 75.0);
+    }
+
+    #[test]
+    fn test_config_settings() {
+        let mut list = VirtualList::new(100, 10, 50.0, Orientation::Vertical);
+
+        // Test default buffer size
+        assert_eq!(list.get_buffer_size(), 5);
+
+        // Test setting buffer size
+        list.set_buffer_size(10);
+        assert_eq!(list.get_buffer_size(), 10);
+
+        // Test binary search setting
+        assert_eq!(list.get_use_binary_search_in_chunk(), true);
+        list.set_use_binary_search_in_chunk(false);
+        assert_eq!(list.get_use_binary_search_in_chunk(), false);
+    }
+
+    #[test]
+    fn test_binary_search_in_chunk() {
+        let mut config = VirtualListConfig::new();
+        config.set_use_binary_search_in_chunk(true);
+
+        let list = VirtualList::new_with_config(100, 10, 50.0, Orientation::Vertical, config);
+
+        // Test finding item in the middle of a chunk
+        let idx = list.binary_search_position(275.0); // Should be in the middle of chunk 0
+        assert_eq!(idx, 5);
+    }
+
+    #[test]
+    fn test_linear_search_in_chunk() {
+        let mut config = VirtualListConfig::new();
+        config.set_use_binary_search_in_chunk(false);
+
+        let list = VirtualList::new_with_config(100, 10, 50.0, Orientation::Vertical, config);
+
+        // Test finding item in the middle of a chunk
+        let idx = list.binary_search_position(275.0); // Should be in the middle of chunk 0
+        assert_eq!(idx, 5);
     }
 }
