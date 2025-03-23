@@ -918,6 +918,220 @@ export default {
 </style>
 ```
 
+### Svelte Integration Example
+
+```svelte
+<script>
+  import { onMount } from 'svelte';
+  
+  // Data for the list
+  let items = Array.from({ length: 10000 }, (_, i) => ({
+    id: i,
+    title: `Item ${i}`,
+    content: `Content for item ${i}`
+  }));
+  
+  let virtualList;
+  let wasm;
+  let visibleItems = [];
+  let listHeight = 0;
+  let containerRef;
+  
+  onMount(async () => {
+    // Import the WASM module
+    wasm = await import('/virtual_list_wasm.js');
+    
+    // Create the configuration
+    const config = new wasm.VirtualListConfig();
+    config.set_buffer_size(5);
+    config.set_overscan_items(3);
+    
+    // Initialize the virtual list
+    virtualList = new wasm.VirtualList(
+      items.length,  // Total items
+      100,           // Chunk size
+      50,            // Estimated item height
+      wasm.Orientation.Vertical,
+      config
+    );
+    
+    // Initial render
+    updateVisibleItems();
+  });
+  
+  function updateVisibleItems() {
+    if (!virtualList || !containerRef) return;
+    
+    const scrollTop = containerRef.scrollTop;
+    const visibleRange = virtualList.get_visible_range(scrollTop, 400);
+    
+    // Get visible items based on range
+    visibleItems = items.slice(visibleRange.start, visibleRange.end)
+      .map((item, i) => ({
+        ...item,
+        index: visibleRange.start + i
+      }));
+    
+    // Set total height
+    listHeight = items.length * 50;
+  }
+  
+  function handleScroll() {
+    updateVisibleItems();
+  }
+  
+  function updateItemSize(index, size) {
+    virtualList.update_item_size(index, size);
+    updateVisibleItems();
+  }
+</script>
+
+<!-- Virtual list container -->
+<div 
+  bind:this={containerRef}
+  on:scroll={handleScroll}
+  style="height: 400px; overflow-y: auto;"
+>
+  <div style="height: {listHeight}px; position: relative;">
+    {#each visibleItems as item}
+      <div style="position: absolute; top: {item.index * 50}px; width: 100%;">
+        <div class="list-item">
+          <h3>{item.title}</h3>
+          <p>{item.content}</p>
+        </div>
+      </div>
+    {/each}
+  </div>
+</div>
+```
+
+### Angular Integration Example
+
+```ts
+// app.component.ts
+import { Component, OnInit, ViewChild, ElementRef, AfterViewInit } from '@angular/core';
+
+declare const import_wasm: () => Promise<any>;
+
+@Component({
+  selector: 'app-root',
+  template: `
+    <div #container 
+      class="virtual-list-container" 
+      (scroll)="onScroll()"
+      [style.height.px]="400">
+      <div [style.height.px]="totalHeight" style="position: relative;">
+        <div *ngFor="let item of visibleItems" 
+          [style.transform]="'translateY(' + (item.index * 50) + 'px)'"
+          [style.position]="'absolute'"
+          [style.width]="'100%'">
+          <div class="list-item">
+            <h3>{{item.title}}</h3>
+            <p>{{item.content}}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  `,
+  styles: [`
+    .virtual-list-container {
+      overflow-y: auto;
+    }
+    .list-item {
+      padding: 10px;
+      border-bottom: 1px solid #eee;
+    }
+  `]
+})
+export class AppComponent implements OnInit, AfterViewInit {
+  @ViewChild('container') containerRef: ElementRef;
+  
+  items: any[] = [];
+  visibleItems: any[] = [];
+  totalHeight = 0;
+  
+  private wasm: any;
+  private virtualList: any;
+  
+  ngOnInit() {
+    // Generate sample data
+    this.items = Array.from({ length: 10000 }, (_, i) => ({
+      id: i,
+      title: `Item ${i}`,
+      content: `Content for item ${i}`,
+      index: i
+    }));
+  }
+  
+  async ngAfterViewInit() {
+    try {
+      // Load WASM module
+      this.wasm = await import_wasm();
+      
+      // Create config
+      const config = new this.wasm.VirtualListConfig();
+      config.set_buffer_size(5);
+      config.set_overscan_items(3);
+      
+      // Initialize virtual list
+      this.virtualList = new this.wasm.VirtualList(
+        this.items.length,
+        100,  // Chunk size
+        50,   // Estimated item height
+        this.wasm.Orientation.Vertical,
+        config
+      );
+      
+      // Set initial total height
+      this.totalHeight = this.items.length * 50;
+      
+      // Initial render
+      this.updateVisibleItems();
+    } catch (err) {
+      console.error('Failed to load WASM module:', err);
+    }
+  }
+  
+  onScroll() {
+    if (!this.virtualList) return;
+    
+    window.requestAnimationFrame(() => {
+      this.updateVisibleItems();
+    });
+  }
+  
+  private updateVisibleItems() {
+    if (!this.virtualList || !this.containerRef) return;
+    
+    const scrollTop = this.containerRef.nativeElement.scrollTop;
+    const visibleRange = this.virtualList.get_visible_range(scrollTop, 400);
+    
+    // Update visible items
+    this.visibleItems = this.items
+      .slice(visibleRange.start, visibleRange.end)
+      .map(item => ({
+        ...item,
+        index: item.id
+      }));
+  }
+  
+  updateItemSize(index: number, size: number) {
+    if (!this.virtualList) return;
+    
+    this.virtualList.update_item_size(index, size);
+    this.updateVisibleItems();
+  }
+  
+  batchUpdateSizes(updates: {index: number, size: number}[]) {
+    if (!this.virtualList) return;
+    
+    const updateArray = updates.map(update => [update.index, update.size]);
+    this.virtualList.batch_update_sizes(updateArray);
+    this.updateVisibleItems();
+  }
+}
+```
+
 ## 🏗️ Architecture
 
 The library is built around these key components:
