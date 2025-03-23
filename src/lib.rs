@@ -2,6 +2,7 @@ use js_sys::Array;
 use wasm_bindgen::prelude::*;
 use serde::Serialize;
 use std::cmp;
+use std::collections::HashMap;
 
 // JS error struct for error reporting
 #[derive(Serialize)]
@@ -38,6 +39,7 @@ pub enum Orientation {
 pub struct VirtualListConfig {
     buffer_size: usize,
     overscan_items: usize,
+    #[allow(dead_code)]
     update_batch_size: usize,
 }
 
@@ -146,7 +148,12 @@ impl Chunk {
         if position.is_nan() || position < 0.0 || position > self.total_size {
             return Err(format!("Invalid position: {}", position));
         }
-        let index = self.prefix_sums.binary_search_by(|&sum| sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)).unwrap_or_else(|e| e - 1);
+        let index = self
+            .prefix_sums
+            .binary_search_by(|&sum| {
+                sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)
+            })
+            .unwrap_or_else(|e| e - 1);
         let offset = position - self.prefix_sums[index];
         Ok((index, offset))
     }
@@ -157,6 +164,7 @@ impl Chunk {
 pub struct VirtualList {
     total_items: usize,
     estimated_size: f64,
+    #[allow(dead_code)]
     orientation: Orientation,
     chunks: Vec<Option<Chunk>>,
     chunk_size: usize,
@@ -291,9 +299,17 @@ impl VirtualList {
         if self.total_items == 0 {
             return Ok((0, 0.0));
         }
-        // Find the chunk using binary search on cumulative_sizes
-        let chunk_idx = self.cumulative_sizes.binary_search_by(|&sum| sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)).unwrap_or_else(|e| e - 1);
-        let chunk_start = if chunk_idx == 0 { 0.0 } else { self.cumulative_sizes[chunk_idx - 1] };
+        let chunk_idx = self
+            .cumulative_sizes
+            .binary_search_by(|&sum| {
+                sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)
+            })
+            .unwrap_or_else(|e| e - 1);
+        let chunk_start = if chunk_idx == 0 {
+            0.0
+        } else {
+            self.cumulative_sizes[chunk_idx - 1]
+        };
         let position_in_chunk = position - chunk_start;
         let chunk = self.get_or_create_chunk(chunk_idx)?;
         let (item_idx, offset) = chunk.find_item_at_position(position_in_chunk)?;
@@ -329,33 +345,52 @@ impl VirtualList {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| convert_error("InvalidUpdate", &e))?;
 
-        let mut errors = Vec::new();
-        for &(index, new_size) in &updates {
+        // Group updates by chunk index
+        let mut chunk_updates: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+        for (index, new_size) in updates {
             if index >= self.total_items {
-                errors.push(format!("Index {} out of bounds", index));
-            } else {
-                let chunk_idx = index / self.chunk_size;
-                let item_idx = index % self.chunk_size;
-                match self.get_or_create_chunk(chunk_idx) {
-                    Ok(chunk) => {
-                        if let Err(e) = chunk.update_size(item_idx, new_size) {
-                            errors.push(e);
-                        } else {
-                            // Update cumulative sizes after each update
-                            let diff = new_size - chunk.sizes[item_idx];
-                            self.update_cumulative_sizes(chunk_idx, diff)?;
-                        }
-                    }
-                    Err(e) => errors.push(e),
-                }
+                return Err(convert_error(
+                    "IndexOutOfBounds",
+                    &format!("Index {} out of bounds", index),
+                ));
+            }
+            let chunk_idx = index / self.chunk_size;
+            let item_idx = index % self.chunk_size;
+            chunk_updates
+                .entry(chunk_idx)
+                .or_insert_with(Vec::new)
+                .push((item_idx, new_size));
+        }
+
+        // Apply updates and calculate net difference per chunk
+        let mut chunk_diffs: HashMap<usize, f64> = HashMap::new();
+        for (chunk_idx, updates) in chunk_updates {
+            let chunk = self
+                .get_or_create_chunk(chunk_idx)
+                .map_err(|e| convert_error("ChunkError", &e))?;
+            let mut total_diff = 0.0;
+            for (item_idx, new_size) in updates {
+                let diff = chunk
+                    .update_size(item_idx, new_size)
+                    .map_err(|e| convert_error("UpdateError", &e))?;
+                total_diff += diff;
+            }
+            chunk_diffs.insert(chunk_idx, total_diff);
+        }
+
+        // Update cumulative sizes in a single pass
+        let min_chunk_idx = chunk_diffs.keys().min().cloned().unwrap_or(0);
+        let mut cumulative_diff = 0.0;
+        for i in min_chunk_idx..self.chunks.len() {
+            if let Some(diff) = chunk_diffs.get(&i) {
+                cumulative_diff += diff;
+            }
+            if i < self.cumulative_sizes.len() {
+                self.cumulative_sizes[i] += cumulative_diff;
             }
         }
+        self.total_size += cumulative_diff;
 
-        if !errors.is_empty() {
-            return Err(convert_error("BatchUpdateError", &errors.join(", ")));
-        }
-
-        self.total_size = self.cumulative_sizes.last().unwrap_or(&0.0).clone();
         Ok(())
     }
 }
