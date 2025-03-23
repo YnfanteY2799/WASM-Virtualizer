@@ -1,6 +1,7 @@
+use js_sys::Array;
 use wasm_bindgen::prelude::*;
 use serde::Serialize;
-use js_sys::Array;
+use std::cmp;
 
 // JS error struct for error reporting
 #[derive(Serialize)]
@@ -37,7 +38,6 @@ pub enum Orientation {
 pub struct VirtualListConfig {
     buffer_size: usize,
     overscan_items: usize,
-    #[allow(dead_code)]
     update_batch_size: usize,
 }
 
@@ -96,10 +96,11 @@ impl VisibleRange {
     }
 }
 
-// Chunk struct to manage item sizes
+// Chunk struct to manage item sizes with prefix sums
 #[derive(Clone)]
 struct Chunk {
     sizes: Vec<f64>,
+    prefix_sums: Vec<f64>,
     total_size: f64,
 }
 
@@ -109,8 +110,19 @@ impl Chunk {
             return Err(format!("Invalid size: {}", estimated_size));
         }
         let sizes = vec![estimated_size; chunk_size];
-        let total_size = estimated_size * chunk_size as f64;
-        Ok(Chunk { sizes, total_size })
+        let mut prefix_sums = Vec::with_capacity(chunk_size + 1);
+        prefix_sums.push(0.0);
+        let mut cumulative = 0.0;
+        for &size in &sizes {
+            cumulative += size;
+            prefix_sums.push(cumulative);
+        }
+        let total_size = cumulative;
+        Ok(Chunk {
+            sizes,
+            prefix_sums,
+            total_size,
+        })
     }
 
     fn update_size(&mut self, index: usize, new_size: f64) -> Result<f64, String> {
@@ -121,9 +133,12 @@ impl Chunk {
             return Err(format!("Invalid size: {}", new_size));
         }
         let old_size = self.sizes[index];
-        self.sizes[index] = new_size;
         let diff = new_size - old_size;
+        self.sizes[index] = new_size;
         self.total_size += diff;
+        for i in index + 1..self.prefix_sums.len() {
+            self.prefix_sums[i] += diff;
+        }
         Ok(diff)
     }
 
@@ -131,26 +146,21 @@ impl Chunk {
         if position.is_nan() || position < 0.0 || position > self.total_size {
             return Err(format!("Invalid position: {}", position));
         }
-        let mut cumulative = 0.0;
-        for (i, &size) in self.sizes.iter().enumerate() {
-            if cumulative + size > position {
-                return Ok((i, position - cumulative));
-            }
-            cumulative += size;
-        }
-        Ok((self.sizes.len() - 1, position - cumulative))
+        let index = self.prefix_sums.binary_search_by(|&sum| sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)).unwrap_or_else(|e| e - 1);
+        let offset = position - self.prefix_sums[index];
+        Ok((index, offset))
     }
 }
 
-// Main VirtualList struct
+// Main VirtualList struct with cumulative sizes
 #[wasm_bindgen]
 pub struct VirtualList {
     total_items: usize,
     estimated_size: f64,
-    #[allow(dead_code)]
     orientation: Orientation,
     chunks: Vec<Option<Chunk>>,
     chunk_size: usize,
+    cumulative_sizes: Vec<f64>,
     total_size: f64,
     config: VirtualListConfig,
 }
@@ -176,13 +186,25 @@ impl VirtualList {
         }
 
         let num_chunks = (total_items + chunk_size - 1) / chunk_size;
-        let total_size = estimated_size * total_items as f64;
+        let mut cumulative_sizes = Vec::with_capacity(num_chunks);
+        let mut total_size = 0.0;
+        for i in 0..num_chunks {
+            let items_in_chunk = if i == num_chunks - 1 && total_items % chunk_size != 0 {
+                total_items % chunk_size
+            } else {
+                chunk_size
+            };
+            let chunk_total = estimated_size * items_in_chunk as f64;
+            total_size += chunk_total;
+            cumulative_sizes.push(total_size);
+        }
         Ok(VirtualList {
             total_items,
             estimated_size,
             orientation,
             chunks: vec![None; num_chunks],
             chunk_size,
+            cumulative_sizes,
             total_size,
             config,
         })
@@ -218,9 +240,18 @@ impl VirtualList {
         let chunk = self
             .get_or_create_chunk(chunk_idx)
             .map_err(|e| convert_error("ChunkError", &e))?;
-        chunk
+        let diff = chunk
             .update_size(item_idx, new_size)
             .map_err(|e| convert_error("UpdateError", &e))?;
+        self.update_cumulative_sizes(chunk_idx, diff)?;
+        Ok(())
+    }
+
+    fn update_cumulative_sizes(&mut self, from_chunk: usize, diff: f64) -> Result<(), String> {
+        for i in from_chunk..self.cumulative_sizes.len() {
+            self.cumulative_sizes[i] += diff;
+        }
+        self.total_size += diff;
         Ok(())
     }
 
@@ -260,20 +291,18 @@ impl VirtualList {
         if self.total_items == 0 {
             return Ok((0, 0.0));
         }
-        // Cache values to avoid borrowing conflicts
-        let chunk_size = self.chunk_size;
-        let estimated_size = self.estimated_size;
-        let chunk_idx = (position / (chunk_size as f64 * estimated_size)) as usize;
-        let chunk = self.get_or_create_chunk(chunk_idx.min(self.chunks.len() - 1))?;
-        let position_in_chunk = position - (chunk_idx as f64 * chunk_size as f64 * estimated_size);
+        // Find the chunk using binary search on cumulative_sizes
+        let chunk_idx = self.cumulative_sizes.binary_search_by(|&sum| sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)).unwrap_or_else(|e| e - 1);
+        let chunk_start = if chunk_idx == 0 { 0.0 } else { self.cumulative_sizes[chunk_idx - 1] };
+        let position_in_chunk = position - chunk_start;
+        let chunk = self.get_or_create_chunk(chunk_idx)?;
         let (item_idx, offset) = chunk.find_item_at_position(position_in_chunk)?;
-        let global_idx = chunk_idx * chunk_size + item_idx;
+        let global_idx = chunk_idx * self.chunk_size + item_idx;
         Ok((global_idx.min(self.total_items - 1), offset))
     }
 
     #[wasm_bindgen]
     pub fn batch_update_sizes(&mut self, updates: Vec<JsValue>) -> Result<(), JsValue> {
-        // Parse the updates from JsValue into (index, size) pairs
         let parsed_updates: Vec<Result<(usize, f64), String>> = updates
             .into_iter()
             .map(|js_val| {
@@ -294,13 +323,12 @@ impl VirtualList {
                 Ok((index, size))
             })
             .collect();
-    
+
         let updates: Vec<(usize, f64)> = parsed_updates
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| convert_error("InvalidUpdate", &e))?;
-    
-        // Process updates sequentially
+
         let mut errors = Vec::new();
         for &(index, new_size) in &updates {
             if index >= self.total_items {
@@ -308,23 +336,26 @@ impl VirtualList {
             } else {
                 let chunk_idx = index / self.chunk_size;
                 let item_idx = index % self.chunk_size;
-                match self.get_or_create_chunk(chunk_idx) {  // Mutable borrow is safe here
+                match self.get_or_create_chunk(chunk_idx) {
                     Ok(chunk) => {
                         if let Err(e) = chunk.update_size(item_idx, new_size) {
                             errors.push(e);
+                        } else {
+                            // Update cumulative sizes after each update
+                            let diff = new_size - chunk.sizes[item_idx];
+                            self.update_cumulative_sizes(chunk_idx, diff)?;
                         }
                     }
                     Err(e) => errors.push(e),
                 }
             }
         }
-    
-        // Update total_size after all changes
+
         if !errors.is_empty() {
             return Err(convert_error("BatchUpdateError", &errors.join(", ")));
         }
-    
-        self.total_size = self.chunks.iter().flatten().map(|chunk| chunk.total_size).sum();
+
+        self.total_size = self.cumulative_sizes.last().unwrap_or(&0.0).clone();
         Ok(())
     }
 }
