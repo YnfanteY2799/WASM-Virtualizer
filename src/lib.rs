@@ -1,8 +1,8 @@
 use wasm_bindgen::prelude::*;
-use std::collections::HashMap;
 
 // Orientation enum for vertical or horizontal scrolling
 #[wasm_bindgen]
+#[derive(Clone, Copy)]
 pub enum Orientation {
     Vertical,
     Horizontal,
@@ -10,65 +10,90 @@ pub enum Orientation {
 
 // Represents a chunk of items for memory efficiency
 struct Chunk {
-    start: usize,
-    end: usize,
-    tree: FenwickTree,
-    sizes: Vec<f64>,
+    start: usize,      // Starting global index of the chunk
+    end: usize,        // Exclusive ending global index of the chunk
+    tree: FenwickTree, // Fenwick Tree for prefix sums within the chunk
+    sizes: Vec<f64>,   // Sizes of items in this chunk
 }
 
 // Main struct for virtualization logic
 #[wasm_bindgen]
 pub struct VirtualList {
-    total_items: usize,
-    estimated_size: f64,
-    orientation: Orientation,
-    chunks: Vec<Chunk>,
-    chunk_size: usize,
-    sparse_sizes: HashMap<usize, f64>, // For items with non-default sizes
+    total_items: usize,           // Total number of items in the list
+    estimated_size: f64,          // Default size for items
+    orientation: Orientation,     // List orientation (vertical or horizontal)
+    chunks: Vec<Chunk>,           // List of chunks
+    chunk_size: usize,            // Number of items per chunk (except possibly the last)
+    cumulative_heights: Vec<f64>, // Cumulative height up to each chunk
 }
 
 #[wasm_bindgen]
 impl VirtualList {
     /// Creates a new VirtualList instance
     #[wasm_bindgen(constructor)]
-    pub fn new(total_items: u32, estimated_size: f64, orientation: Orientation, chunk_size: u32) -> Self {
+    pub fn new(
+        total_items: u32,
+        estimated_size: f64,
+        orientation: Orientation,
+        chunk_size: u32,
+    ) -> Self {
         let total_items = total_items as usize;
         let chunk_size = chunk_size as usize;
         let mut chunks = Vec::new();
+        let mut cumulative_height = 0.0;
+        let mut cumulative_heights = Vec::new();
+
+        // Create chunks with ranges and initialize sizes
         for start in (0..total_items).step_by(chunk_size) {
             let end = (start + chunk_size).min(total_items);
+            // Line specified by user: initialize Fenwick Tree with chunk size
             let mut tree = FenwickTree::new(end - start);
             let sizes = vec![estimated_size; end - start];
-            for i in start..end {
-                tree.update(i - start, estimated_size);
+            // Populate the Fenwick Tree with initial sizes
+            for i in 0..(end - start) {
+                tree.update(i, estimated_size);
             }
-            chunks.push(Chunk { start, end, tree, sizes });
+            chunks.push(Chunk {
+                start,
+                end,
+                tree,
+                sizes,
+            });
+            cumulative_heights.push(cumulative_height);
+            cumulative_height += (end - start) as f64 * estimated_size;
         }
+
         VirtualList {
             total_items,
             estimated_size,
             orientation,
             chunks,
             chunk_size,
-            sparse_sizes: HashMap::new(),
+            cumulative_heights,
         }
     }
 
-    /// Updates the sizes of specified items
+    /// Updates the sizes of specified items and recalculates cumulative heights
     pub fn update_item_sizes(&mut self, indices: &[u32], sizes: &[f64]) {
         for (&index, &size) in indices.iter().zip(sizes.iter()) {
             let i = index as usize;
             if i < self.total_items {
-                self.sparse_sizes.insert(i, size);
-                // Update the corresponding chunk
                 let chunk_index = i / self.chunk_size;
                 if let Some(chunk) = self.chunks.get_mut(chunk_index) {
-                    let local_i = i % self.chunk_size;
+                    // Use chunk.start to compute local index
+                    let local_i = i - chunk.start;
                     let delta = size - chunk.sizes[local_i];
                     chunk.tree.update(local_i, delta);
                     chunk.sizes[local_i] = size;
                 }
             }
+        }
+        // Update cumulative heights after size changes
+        let mut cumulative_height = 0.0;
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            self.cumulative_heights[i] = cumulative_height;
+            // Total height of the chunk
+            cumulative_height += chunk.tree.prefix_sum(chunk.sizes.len());
         }
     }
 
@@ -81,10 +106,13 @@ impl VirtualList {
         output: &mut [f64],
     ) -> u32 {
         let start = self.find_smallest_i_where_prefix_sum_ge(scroll_position);
-        let end = self.find_largest_j_where_prefix_sum_le(scroll_position + viewport_size).unwrap_or(0);
+        let end = self
+            .find_largest_j_where_prefix_sum_le(scroll_position + viewport_size)
+            .unwrap_or(0);
         let overscan_start = start.saturating_sub(overscan as usize);
-        let overscan_end = (end + overscan as usize).min(self.total_items - 1);
+        let overscan_end = (end + overscan as usize).min(self.total_items.saturating_sub(1));
         let mut count = 0;
+
         for i in overscan_start..=overscan_end {
             if count * 2 + 1 < output.len() {
                 output[count * 2] = i as f64; // Index
@@ -97,18 +125,23 @@ impl VirtualList {
         count as u32
     }
 
-    // Helper to get the position of an item
+    /// Gets the global position of an item
     fn get_position(&self, index: usize) -> f64 {
+        if index >= self.total_items {
+            return 0.0;
+        }
         let chunk_index = index / self.chunk_size;
         if let Some(chunk) = self.chunks.get(chunk_index) {
-            let local_i = index % self.chunk_size;
-            chunk.tree.prefix_sum(local_i)
+            // Use chunk.start to compute local index
+            let local_i = index - chunk.start;
+            // Global position = cumulative height before this chunk + position within chunk
+            self.cumulative_heights[chunk_index] + chunk.tree.prefix_sum(local_i)
         } else {
             0.0
         }
     }
 
-    // Binary search to find the smallest index where prefix sum >= target
+    /// Finds the smallest index where the prefix sum >= target
     fn find_smallest_i_where_prefix_sum_ge(&self, target: f64) -> usize {
         let mut low = 0;
         let mut high = self.total_items;
@@ -124,7 +157,7 @@ impl VirtualList {
         low
     }
 
-    // Binary search to find the largest index where prefix sum <= target
+    /// Finds the largest index where the prefix sum <= target
     fn find_largest_j_where_prefix_sum_le(&self, target: f64) -> Option<usize> {
         let mut low = 0;
         let mut high = self.total_items;
@@ -141,6 +174,16 @@ impl VirtualList {
         }
         result
     }
+
+    /// Getter for estimated_size to ensure it’s used
+    pub fn get_estimated_size(&self) -> f64 {
+        self.estimated_size
+    }
+
+    /// Getter for orientation to ensure it’s used
+    pub fn get_orientation(&self) -> Orientation {
+        self.orientation
+    }
 }
 
 // Fenwick Tree for efficient prefix sum calculations
@@ -156,10 +199,10 @@ impl FenwickTree {
     }
 
     fn update(&mut self, mut index: usize, delta: f64) {
-        index += 1;
+        index += 1; // Fenwick Tree uses 1-based indexing internally
         while index < self.tree.len() {
             self.tree[index] += delta;
-            index += index & index.wrapping_neg();
+            index += index & index.wrapping_neg(); // Move to next relevant index
         }
     }
 
@@ -167,7 +210,7 @@ impl FenwickTree {
         let mut sum = 0.0;
         while index > 0 {
             sum += self.tree[index];
-            index -= index & index.wrapping_neg();
+            index -= index & index.wrapping_neg(); // Move to parent
         }
         sum
     }
