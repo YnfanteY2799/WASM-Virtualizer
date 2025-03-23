@@ -11,7 +11,6 @@ pub enum Orientation {
 // Represents a chunk of items for memory efficiency
 struct Chunk {
     start: usize,      // Starting global index of the chunk
-    end: usize,        // Exclusive ending global index of the chunk
     tree: FenwickTree, // Fenwick Tree for prefix sums within the chunk
     sizes: Vec<f64>,   // Sizes of items in this chunk
 }
@@ -101,7 +100,6 @@ impl VirtualList {
             }
             chunks.push(Chunk {
                 start,
-                end,
                 tree,
                 sizes,
             });
