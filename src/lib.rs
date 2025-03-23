@@ -1,4 +1,5 @@
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsError;
 
 // Orientation enum for horizontal or vertical lists
 #[wasm_bindgen]
@@ -6,13 +7,6 @@ use wasm_bindgen::prelude::*;
 pub enum Orientation {
     Vertical,
     Horizontal,
-}
-
-// Custom error type for precise error handling
-#[derive(Debug)]
-pub enum VirtualListError {
-    InvalidInput(String),
-    IndexOutOfBounds(usize),
 }
 
 // Structure to hold a chunk of items with their sizes and prefix sums
@@ -78,7 +72,9 @@ impl VisibleItem {
 #[wasm_bindgen]
 pub struct VirtualList {
     total_items: usize,         // Total number of items in the list
+    #[allow(dead_code)]
     estimated_size: f64,        // Default size for unmeasured items
+    #[allow(dead_code)]
     orientation: Orientation,   // List orientation (vertical or horizontal)
     chunks: Vec<Chunk>,         // Chunks of items for efficient management
     chunk_size: usize,          // Number of items per chunk
@@ -143,9 +139,9 @@ impl VirtualList {
     /// Updates the sizes of items at the specified indices.
     /// Returns an error if indices and sizes lengths don't match, sizes are negative,
     /// or indices are out of bounds.
-    pub fn update_item_sizes(&mut self, indices: &[u32], sizes: &[f64]) -> Result<(), VirtualListError> {
+    pub fn update_item_sizes(&mut self, indices: &[u32], sizes: &[f64]) -> Result<(), JsError> {
         if indices.len() != sizes.len() {
-            return Err(VirtualListError::InvalidInput(format!(
+            return Err(JsError::new(&format!(
                 "Indices length ({}) must match sizes length ({})",
                 indices.len(),
                 sizes.len()
@@ -153,14 +149,17 @@ impl VirtualList {
         }
         for (&index, &size) in indices.iter().zip(sizes.iter()) {
             if size < 0.0 {
-                return Err(VirtualListError::InvalidInput(format!(
+                return Err(JsError::new(&format!(
                     "Item size must be non-negative, got {} at index {}",
                     size, index
                 )));
             }
             let i = index as usize;
             if i >= self.total_items {
-                return Err(VirtualListError::IndexOutOfBounds(i));
+                return Err(JsError::new(&format!(
+                    "Index {} out of bounds, total items: {}",
+                    i, self.total_items
+                )));
             }
         }
 
@@ -221,7 +220,12 @@ impl VirtualList {
     /// Gets the position of an item by its index.
     /// Assumes that index < total_items; debug assertion enforces this in debug builds.
     fn get_position(&self, index: usize) -> f64 {
-        debug_assert!(index < self.total_items, "Index {} out of bounds, total_items: {}", index, self.total_items);
+        debug_assert!(
+            index < self.total_items,
+            "Index {} out of bounds, total_items: {}",
+            index,
+            self.total_items
+        );
         let chunk_index = index / self.chunk_size;
         let chunk = &self.chunks[chunk_index];
         let local_i = index - chunk.start;
@@ -266,5 +270,17 @@ impl VirtualList {
             }
         }
         high.saturating_sub(1)
+    }
+
+    /// Checked version of get_position that returns a Result for safe index handling.
+    pub fn checked_get_position(&self, index: usize) -> Result<f64, JsError> {
+        if index >= self.total_items {
+            Err(JsError::new(&format!(
+                "Index {} out of bounds, total items: {}",
+                index, self.total_items
+            )))
+        } else {
+            Ok(self.get_position(index))
+        }
     }
 }
