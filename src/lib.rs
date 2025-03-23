@@ -27,9 +27,41 @@ pub struct VirtualList {
     cumulative_heights: Vec<f64>, // Cumulative height up to each chunk
 }
 
+// Fenwick Tree optimized for speed
+struct FenwickTree {
+    tree: Vec<f64>,
+}
+
+// Struct to represent a visible item, exposed to JavaScript
+#[wasm_bindgen]
+pub struct VisibleItem {
+    pub index: u32,
+    pub position: f64,
+}
+
 #[wasm_bindgen]
 impl VirtualList {
-    /// Creates a new VirtualList instance with robust input validation
+    /// Creates a new VirtualList instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_items` - Total number of items in the list (max: u32::MAX).
+    /// * `estimated_size` - Initial estimated size for each item (must be non-negative).
+    /// * `orientation` - Orientation of the list (Vertical or Horizontal).
+    /// * `chunk_size` - Number of items per chunk (must be positive).
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `estimated_size` is negative.
+    /// - `chunk_size` is zero.
+    /// - Memory allocation would overflow due to `total_items` and `chunk_size`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let list = VirtualList::new(100, 50.0, Orientation::Vertical, 10);
+    /// ```
     #[wasm_bindgen(constructor)]
     pub fn new(
         total_items: u32,
@@ -37,7 +69,6 @@ impl VirtualList {
         orientation: Orientation,
         chunk_size: u32,
     ) -> Self {
-        // Validate inputs
         if estimated_size < 0.0 {
             panic!(
                 "Estimated size must be non-negative, got {}",
@@ -50,7 +81,6 @@ impl VirtualList {
         let total_items = total_items as usize;
         let chunk_size = chunk_size as usize;
 
-        // Prevent excessive memory allocation
         if total_items > usize::MAX / chunk_size {
             panic!(
                 "Total items and chunk size combination would overflow memory allocation limits"
@@ -61,13 +91,11 @@ impl VirtualList {
         let mut cumulative_heights = Vec::with_capacity(chunks.capacity());
         let mut cumulative_height = 0.0;
 
-        // Create chunks efficiently
         for start in (0..total_items).step_by(chunk_size) {
             let end = (start + chunk_size).min(total_items);
             let chunk_len = end - start;
             let mut tree = FenwickTree::new(chunk_len);
             let sizes = vec![estimated_size; chunk_len];
-            // Inline initialization for speed
             for i in 0..chunk_len {
                 tree.tree[i + 1] = estimated_size * (i + 1) as f64;
             }
@@ -91,49 +119,61 @@ impl VirtualList {
         }
     }
 
-    /// Updates item sizes with comprehensive error checking and optimized updates
-    pub fn update_item_sizes(&mut self, indices: &[u32], sizes: &[f64]) {
-        // Validate input arrays
+    /// Updates the sizes of specified items.
+    ///
+    /// # Arguments
+    ///
+    /// * `indices` - Indices of items to update.
+    /// * `sizes` - New sizes for the items (must match `indices` length).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` on success.
+    /// - `Err(String)` if:
+    ///   - `indices` and `sizes` lengths differ.
+    ///   - Any size is negative.
+    ///   - Any index is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let mut list = VirtualList::new(5, 10.0, Orientation::Vertical, 2);
+    /// list.update_item_sizes(&[0, 1], &[20.0, 30.0]).unwrap();
+    /// ```
+    pub fn update_item_sizes(&mut self, indices: &[u32], sizes: &[f64]) -> Result<(), String> {
         if indices.len() != sizes.len() {
-            panic!(
+            return Err(format!(
                 "Indices length ({}) must match sizes length ({})",
                 indices.len(),
                 sizes.len()
-            );
+            ));
         }
-        if indices.is_empty() {
-            return; // Early return for empty input
-        }
-
-        // Validate each size and index
         for (&index, &size) in indices.iter().zip(sizes.iter()) {
             if size < 0.0 {
-                panic!(
+                return Err(format!(
                     "Item size must be non-negative, got {} at index {}",
                     size, index
-                );
+                ));
             }
             let i = index as usize;
             if i >= self.total_items {
-                panic!(
+                return Err(format!(
                     "Index {} out of bounds, total items: {}",
                     i, self.total_items
-                );
+                ));
             }
         }
 
-        // Batch updates for efficiency
         for (&index, &size) in indices.iter().zip(sizes.iter()) {
             let i = index as usize;
             let chunk_index = i / self.chunk_size;
-            let chunk = unsafe { self.chunks.get_unchecked_mut(chunk_index) }; // Bounds checked above
+            let chunk = unsafe { self.chunks.get_unchecked_mut(chunk_index) };
             let local_i = i - chunk.start;
             let delta = size - chunk.sizes[local_i];
             chunk.sizes[local_i] = size;
             chunk.tree.update(local_i, delta);
         }
 
-        // Optimize cumulative heights update
         let mut cumulative_height = 0.0;
         for (i, chunk) in self.chunks.iter().enumerate() {
             unsafe {
@@ -141,27 +181,37 @@ impl VirtualList {
             }
             cumulative_height += chunk.tree.prefix_sum(chunk.sizes.len());
         }
+        Ok(())
     }
 
-    /// Computes visible range with robust checks and high performance
+    /// Computes the range of visible items based on scroll position and viewport size.
+    ///
+    /// # Arguments
+    ///
+    /// * `scroll_position` - Current scroll position (negative values treated as 0).
+    /// * `viewport_size` - Size of the viewport (negative values treated as 0).
+    /// * `overscan` - Number of extra items to include before and after the visible range.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `VisibleItem` structs with the index and position of each visible item.
+    /// Returns an empty vector if `total_items == 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let list = VirtualList::new(10, 50.0, Orientation::Vertical, 5);
+    /// let visible = list.compute_visible_range(100.0, 200.0, 1);
+    /// ```
     pub fn compute_visible_range(
         &self,
         scroll_position: f64,
         viewport_size: f64,
         overscan: u32,
-        output: &mut [f64],
-    ) -> u32 {
-        // Validate inputs
-        if scroll_position < 0.0 {
-            panic!(
-                "Scroll position must be non-negative, got {}",
-                scroll_position
-            );
+    ) -> Vec<VisibleItem> {
+        if self.total_items == 0 {
+            return vec![];
         }
-        if viewport_size < 0.0 {
-            panic!("Viewport size must be non-negative, got {}", viewport_size);
-        }
-
         let start = self.find_smallest_i_where_prefix_sum_ge(scroll_position);
         let end = self
             .find_largest_j_where_prefix_sum_le(scroll_position + viewport_size)
@@ -169,31 +219,18 @@ impl VirtualList {
         let overscan = overscan as usize;
         let overscan_start = start.saturating_sub(overscan);
         let overscan_end = (end + overscan).min(self.total_items.saturating_sub(1));
-        let item_count = overscan_end - overscan_start + 1;
-        let required_buffer_size = item_count * 2;
-
-        if output.len() < required_buffer_size {
-            panic!(
-                "Output buffer too small: need {} elements, got {}",
-                required_buffer_size,
-                output.len()
-            );
-        }
-
-        // Fast population of output buffer
-        let mut count = 0;
+        let mut visible_items = Vec::with_capacity(overscan_end - overscan_start + 1);
         for i in overscan_start..=overscan_end {
-            unsafe {
-                *output.get_unchecked_mut(count * 2) = i as f64; // Index
-                *output.get_unchecked_mut(count * 2 + 1) = self.get_position(i);
-                // Position
-            }
-            count += 1;
+            let position = self.get_position(i);
+            visible_items.push(VisibleItem {
+                index: i as u32,
+                position,
+            });
         }
-        count as u32
+        visible_items
     }
 
-    /// Gets item position with safety checks
+    /// Gets the position of an item by its index.
     fn get_position(&self, index: usize) -> f64 {
         if index >= self.total_items {
             panic!(
@@ -209,7 +246,7 @@ impl VirtualList {
         }
     }
 
-    /// Optimized binary search for smallest index where prefix sum >= target
+    /// Finds the smallest index where the prefix sum is >= target.
     fn find_smallest_i_where_prefix_sum_ge(&self, target: f64) -> usize {
         if target <= 0.0 {
             return 0;
@@ -228,7 +265,7 @@ impl VirtualList {
         low
     }
 
-    /// Optimized binary search for largest index where prefix sum <= target
+    /// Finds the largest index where the prefix sum is <= target.
     fn find_largest_j_where_prefix_sum_le(&self, target: f64) -> Option<usize> {
         if target < 0.0 {
             return None;
@@ -249,20 +286,15 @@ impl VirtualList {
         result
     }
 
-    /// Getter for estimated_size
+    /// Returns the estimated size of items.
     pub fn get_estimated_size(&self) -> f64 {
         self.estimated_size
     }
 
-    /// Getter for orientation
+    /// Returns the orientation of the list.
     pub fn get_orientation(&self) -> Orientation {
         self.orientation
     }
-}
-
-// Fenwick Tree optimized for speed
-struct FenwickTree {
-    tree: Vec<f64>,
 }
 
 impl FenwickTree {
@@ -295,3 +327,4 @@ impl FenwickTree {
         sum
     }
 }
+
