@@ -1,8 +1,8 @@
 use js_sys::Array;
-use wasm_bindgen::prelude::*;
 use serde::Serialize;
 use std::cmp;
 use std::collections::HashMap;
+use wasm_bindgen::prelude::*;
 
 #[derive(Serialize)]
 struct JsError {
@@ -35,6 +35,7 @@ pub enum Orientation {
 pub struct VirtualListConfig {
     buffer_size: usize,
     overscan_items: usize,
+    #[allow(dead_code)]
     update_batch_size: usize,
     max_loaded_chunks: Option<usize>,
 }
@@ -164,9 +165,7 @@ impl Chunk {
         }
         let index = self
             .prefix_sums
-            .binary_search_by(|&sum| {
-                sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)
-            })
+            .binary_search_by(|&sum| sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater))
             .unwrap_or_else(|e| e - 1);
         let offset = position - self.prefix_sums[index];
         Ok((index, offset))
@@ -177,6 +176,7 @@ impl Chunk {
 pub struct VirtualList {
     total_items: usize,
     estimated_size: f64,
+    #[allow(dead_code)]
     orientation: Orientation,
     chunks: Vec<Option<Chunk>>,
     chunk_size: usize,
@@ -198,7 +198,10 @@ impl VirtualList {
         config: VirtualListConfig,
     ) -> Result<VirtualList, JsValue> {
         if chunk_size == 0 {
-            return Err(convert_error("InvalidConfig", "chunk_size must be positive"));
+            return Err(convert_error(
+                "InvalidConfig",
+                "chunk_size must be positive",
+            ));
         }
         if estimated_size.is_nan() || estimated_size < 0.0 {
             return Err(convert_error(
@@ -245,7 +248,9 @@ impl VirtualList {
         // Handle unloading before borrowing the chunk
         if let Some(max) = self.config.max_loaded_chunks {
             if self.chunk_access.len() >= max && !self.chunk_access.contains_key(&chunk_idx) {
-                if let Some((&lru_chunk, _)) = self.chunk_access.iter().min_by_key(|&(_, &access)| access) {
+                if let Some((&lru_chunk, _)) =
+                    self.chunk_access.iter().min_by_key(|&(_, &access)| access)
+                {
                     if lru_chunk != chunk_idx {
                         self.unload_chunk(lru_chunk)?;
                     }
@@ -255,13 +260,12 @@ impl VirtualList {
 
         // Now safely create or access the chunk
         if self.chunks[chunk_idx].is_none() {
-            let items_in_chunk = if chunk_idx == self.chunks.len() - 1
-                && self.total_items % self.chunk_size != 0
-            {
-                self.total_items % self.chunk_size
-            } else {
-                self.chunk_size
-            };
+            let items_in_chunk =
+                if chunk_idx == self.chunks.len() - 1 && self.total_items % self.chunk_size != 0 {
+                    self.total_items % self.chunk_size
+                } else {
+                    self.chunk_size
+                };
             self.chunks[chunk_idx] = Some(
                 Chunk::new(items_in_chunk, self.estimated_size)
                     .map_err(|e| convert_error("ChunkCreationError", &e))?,
@@ -311,7 +315,10 @@ impl VirtualList {
         viewport_size: f64,
     ) -> Result<VisibleRange, JsValue> {
         if viewport_size <= 0.0 {
-            return Err(convert_error("InvalidViewport", "Viewport size must be positive"));
+            return Err(convert_error(
+                "InvalidViewport",
+                "Viewport size must be positive",
+            ));
         }
         if self.total_items == 0 {
             return Err(convert_error("EmptyList", "List is empty"));
@@ -342,9 +349,7 @@ impl VirtualList {
         }
         let chunk_idx = self
             .cumulative_sizes
-            .binary_search_by(|&sum| {
-                sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater)
-            })
+            .binary_search_by(|&sum| sum.partial_cmp(&position).unwrap_or(cmp::Ordering::Greater))
             .unwrap_or_else(|e| e - 1);
         let chunk_start = if chunk_idx == 0 {
             0.0
@@ -371,10 +376,10 @@ impl VirtualList {
                 if arr.length() != 2 {
                     return Err("Each update must be an array of [index, size]".to_string());
                 }
-                let index = arr
-                    .get(0)
-                    .as_f64()
-                    .ok_or("Index must be a number".to_string())? as usize;
+                let index =
+                    arr.get(0)
+                        .as_f64()
+                        .ok_or("Index must be a number".to_string())? as usize;
                 let size = arr
                     .get(1)
                     .as_f64()
@@ -528,13 +533,12 @@ impl VirtualList {
     }
 
     fn estimated_chunk_total(&self, chunk_idx: usize) -> f64 {
-        let items_in_chunk = if chunk_idx == self.chunks.len() - 1
-            && self.total_items % self.chunk_size != 0
-        {
-            self.total_items % self.chunk_size
-        } else {
-            self.chunk_size
-        };
+        let items_in_chunk =
+            if chunk_idx == self.chunks.len() - 1 && self.total_items % self.chunk_size != 0 {
+                self.total_items % self.chunk_size
+            } else {
+                self.chunk_size
+            };
         items_in_chunk as f64 * self.estimated_size
     }
 }
