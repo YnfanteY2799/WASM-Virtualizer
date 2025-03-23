@@ -211,7 +211,7 @@ impl Chunk {
     }
 
     #[warn(dead_code)]
-    fn _len(&self) -> usize {
+    fn len(&self) -> usize {
         self.sizes.len()
     }
 
@@ -241,7 +241,7 @@ impl Chunk {
     }
 
     #[warn(dead_code)]
-    fn _get_position(&self, index: usize) -> Result<f32, VirtualListError> {
+    fn get_position(&self, index: usize) -> Result<f32, VirtualListError> {
         self.prefix_sums
             .get(index)
             .copied()
@@ -530,7 +530,7 @@ impl VirtualList {
         while low < high {
             let mid = low + (high - low) / 2;
             let cumulative = self.cumulative_sizes.get(&mid).copied().unwrap_or_else(|| {
-                let _items = if mid == num_chunks - 1 && self.total_items % self.chunk_size != 0 {
+                let items = if mid == num_chunks - 1 && self.total_items % self.chunk_size != 0 {
                     self.total_items % self.chunk_size
                 } else {
                     self.chunk_size
