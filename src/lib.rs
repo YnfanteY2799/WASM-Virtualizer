@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::cmp;
 use std::collections::{HashMap, VecDeque};
 use wasm_bindgen::prelude::*;
-use serde::{Serialize, Deserialize};
 
 // Enums and Structs
 #[wasm_bindgen]
@@ -21,8 +21,8 @@ pub enum VirtualListError {
     EmptyList,
 }
 
-#[derive(Serialize, Deserialize)]
 #[wasm_bindgen]
+#[derive(Serialize, Deserialize)]
 pub struct JsError {
     kind: String,
     message: String,
@@ -212,11 +212,17 @@ impl Chunk {
     }
 
     fn get_size(&self, index: usize) -> Result<f32, VirtualListError> {
-        self.sizes.get(index).copied().ok_or(VirtualListError::IndexOutOfBounds)
+        self.sizes
+            .get(index)
+            .copied()
+            .ok_or(VirtualListError::IndexOutOfBounds)
     }
 
     fn get_position(&self, index: usize) -> Result<f32, VirtualListError> {
-        self.prefix_sums.get(index).copied().ok_or(VirtualListError::IndexOutOfBounds)
+        self.prefix_sums
+            .get(index)
+            .copied()
+            .ok_or(VirtualListError::IndexOutOfBounds)
     }
 
     fn find_item_at_position(&self, position: f32) -> Result<(usize, f32), VirtualListError> {
@@ -266,7 +272,12 @@ pub struct VirtualList {
 #[wasm_bindgen]
 impl VirtualList {
     #[wasm_bindgen(constructor)]
-    pub fn new(total_items: usize, chunk_size: usize, estimated_size: f32, orientation: Orientation) -> VirtualList {
+    pub fn new(
+        total_items: usize,
+        chunk_size: usize,
+        estimated_size: f32,
+        orientation: Orientation,
+    ) -> VirtualList {
         let config = VirtualListConfig::new();
         Self::new_with_config(total_items, chunk_size, estimated_size, orientation, config)
     }
@@ -298,14 +309,16 @@ impl VirtualList {
 
     fn get_or_create_chunk(&mut self, chunk_idx: usize) -> Result<&mut Chunk, VirtualListError> {
         if !self.chunks.contains_key(&chunk_idx) {
-            let items_in_chunk = if chunk_idx == (self.total_items + self.chunk_size - 1) / self.chunk_size - 1
+            let items_in_chunk = if chunk_idx
+                == (self.total_items + self.chunk_size - 1) / self.chunk_size - 1
                 && self.total_items % self.chunk_size != 0
             {
                 self.total_items % self.chunk_size
             } else {
                 self.chunk_size
             };
-            self.chunks.insert(chunk_idx, Chunk::new(items_in_chunk, self.estimated_size));
+            self.chunks
+                .insert(chunk_idx, Chunk::new(items_in_chunk, self.estimated_size));
             self.update_cumulative_sizes(chunk_idx)?;
             self.chunk_access_order.push_back(chunk_idx);
 
@@ -379,13 +392,19 @@ impl VirtualList {
         let chunk_idx = index / self.chunk_size;
         let item_idx = index % self.chunk_size;
         let chunk = self.get_or_create_chunk(chunk_idx).map_err(convert_error)?;
-        let diff = chunk.update_size(item_idx, new_size).map_err(convert_error)?;
+        let diff = chunk
+            .update_size(item_idx, new_size)
+            .map_err(convert_error)?;
         self.total_size += diff;
         Ok(())
     }
 
     #[wasm_bindgen]
-    pub fn get_visible_range(&mut self, scroll_position: f32, viewport_size: f32) -> Result<VisibleRange, JsValue> {
+    pub fn get_visible_range(
+        &mut self,
+        scroll_position: f32,
+        viewport_size: f32,
+    ) -> Result<VisibleRange, JsValue> {
         if viewport_size <= 0.0 {
             return Err(convert_error(VirtualListError::InvalidViewport));
         }
@@ -485,14 +504,19 @@ impl VirtualList {
         for (index, size) in self.pending_updates.drain(..) {
             let chunk_idx = index / self.chunk_size;
             let item_idx = index % self.chunk_size;
-            chunk_updates.entry(chunk_idx).or_default().push((item_idx, size));
+            chunk_updates
+                .entry(chunk_idx)
+                .or_default()
+                .push((item_idx, size));
         }
 
         let mut total_diff = 0.0;
         for (chunk_idx, updates) in chunk_updates {
             let chunk = self.get_or_create_chunk(chunk_idx).map_err(convert_error)?;
             for (item_idx, new_size) in updates {
-                total_diff += chunk.update_size(item_idx, new_size).map_err(convert_error)?;
+                total_diff += chunk
+                    .update_size(item_idx, new_size)
+                    .map_err(convert_error)?;
             }
         }
         self.total_size += total_diff;

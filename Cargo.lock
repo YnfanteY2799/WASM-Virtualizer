@@ -584,6 +584,7 @@ name = "wasm_virtualizer"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "serde",
  "serde-wasm-bindgen",
  "wasm-bindgen",
  "wasm-bindgen-test",
